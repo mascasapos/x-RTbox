@@ -1433,7 +1433,12 @@ class EspHal : public minic::Hal {
           case NF_IDF_FADE_TIME: idfEnsureFade(); return ledc_set_fade_with_time(M, C, (uint32_t)a[2], (int)a[3]);
           case NF_IDF_FADE_STEP: idfEnsureFade(); return ledc_set_fade_with_step(M, C, (uint32_t)a[2], (uint32_t)a[3], (uint32_t)a[4]);
           case NF_IDF_FADE_START: idfEnsureFade(); return ledc_fade_start(M, C, (ledc_fade_mode_t)(int)a[2]);
-          case NF_IDF_FADE_STOP: return ledc_fade_stop(M, C);
+          case NF_IDF_FADE_STOP:
+#if SOC_LEDC_SUPPORT_FADE_STOP
+            return ledc_fade_stop(M, C);
+#else
+            return ESP_ERR_NOT_SUPPORTED;   // el ESP32 clasico no puede parar un fade a medias
+#endif
           case NF_IDF_FADE_TIME_START:
             idfEnsureFade();
             return ledc_set_fade_time_and_start(M, C, (uint32_t)a[2], (uint32_t)a[3], (ledc_fade_mode_t)(int)a[4]);
