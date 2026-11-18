@@ -44,6 +44,9 @@ static const bool kTyUns[TY__COUNT] = {false, true, false, true, false, false, t
                                        false, true, false, false, false, false, false, false};
 static const uint8_t kTySize[TY__COUNT] = {0, 1, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 12, 4, 4, 8};
 static inline bool tyIsInt(uint8_t t) { return t >= TY_BOOL && t <= TY_U64; }
+// estructuras: el tipo TY_STRUCT0 + n es la estructura numero n
+static const uint8_t TY_STRUCT0 = 32;
+static inline bool tyIsStruct(uint8_t t) { return t >= TY_STRUCT0; }
 
 // ---------------------------------------------------------------------
 //  Valores en tiempo de ejecucion
@@ -104,6 +107,7 @@ struct StrObj {
 struct ArrObj {
   int32_t rc;
   uint8_t elemTy;
+  int16_t sid = -1;   // >= 0: es una estructura (los campos van en v)
   std::vector<Value> v;
 };
 
@@ -136,7 +140,9 @@ enum NodeKind : uint8_t {
   N_BLOCK, N_EXPR, N_DECL, N_IF, N_WHILE, N_DOWHILE, N_FOR, N_FOREACH, N_BREAK, N_CONTINUE,
   N_RETURN, N_SWITCH, N_CASE, N_DEFAULT, N_EMPTY, N_DIM,
   // referencia a funcion (para interrupciones) y &variable
-  N_FUNCREF, N_ADDR
+  N_FUNCREF, N_ADDR,
+  // estructuras: x.campo y .campo = valor en { }
+  N_FIELD, N_DESIG
 };
 
 struct Node {
@@ -251,13 +257,17 @@ static const BuiltinDef kBuiltins[B__COUNT] = {
 //  Funciones del ESP32 (las ejecuta el firmware con Hal::native) y
 //  funciones especiales que resuelve el propio interprete (codigo < 0)
 // ---------------------------------------------------------------------
-enum NativeFlags { XF_SELF = 1, XF_BUS = 2, XF_NOEVAL = 4 };
+enum NativeFlags { XF_SELF = 1, XF_BUS = 2, XF_NOEVAL = 4, XF_STRUCT = 8 };
+// estructuras de ESP-IDF que ya trae el interprete (en este orden)
+enum BuiltinStruct { BS_LEDC_FLAGS = 0, BS_LEDC_TIMER, BS_LEDC_CHANNEL, BS_GPIO_CONFIG, BS__COUNT };
 enum XSpecial {
   XS_ATTACH_INT = -1, XS_DETACH_INT = -2, XS_TIMER_BEGIN = -3, XS_TIMER_ATTACH = -4,
   XS_TIMER_DETACH = -5, XS_NOINT = -6, XS_INT = -7, XS_CRIT_ENTER = -8, XS_CRIT_EXIT = -9,
   XS_PIN2INT = -10, XS_FREQ_READ = -11, XS_SPISETTINGS = -12, XS_WIRE_WRITE = -13,
   XS_SPI_TRANSFER = -14, XS_STR = -15, XS_FMIN = -16, XS_FMAX = -17, XS_HYPOT = -18,
-  XS_TRUNC = -19, XS_CBRT = -20
+  XS_TRUNC = -19, XS_CBRT = -20, XS_VTASKDELAY = -21, XS_IDENT = -22, XS_TICKS = -23,
+  XS_DELAYUS = -24, XS_ESPCHECK = -25, XS_ESPCHECK_NA = -26, XS_ERRNAME = -27, XS_PRINTF = -28,
+  XS_LOG = -29, XS_MEMSET = -30, XS_NOOP = -31, XS_BIT = -32
 };
 
 struct NativeDef {
@@ -395,6 +405,68 @@ static const NativeDef kNatives[] = {
   {"hypot", 2, 2, XS_HYPOT, 'f', -1, false, 0, 0},
   {"trunc", 1, 1, XS_TRUNC, 'f', -1, false, 0, 0},
   {"cbrt", 1, 1, XS_CBRT, 'f', -1, false, 0, 0},
+  {"ledcOutputInvert", 2, 2, NF_LEDC_INVERT, 'b', 0, true, 0, 0},
+  {"sigmaDeltaAttach", 2, 2, NF_SD_ATTACH, 'b', 0, true, 0, 0},
+  {"sigmaDeltaWrite", 2, 2, NF_SD_WRITE, 'b', 0, true, 0, 0},
+  {"sigmaDeltaDetach", 1, 1, NF_SD_DETACH, 'b', 0, true, 0, 0},
+  // ESP-IDF: driver/ledc.h
+  {"ledc_timer_config", 1, 1, NF_IDF_LEDC_TIMER, 'i', -1, false, XF_STRUCT, BS_LEDC_TIMER},
+  {"ledc_channel_config", 1, 1, NF_IDF_LEDC_CHANNEL, 'i', -1, false, XF_STRUCT, BS_LEDC_CHANNEL},
+  {"ledc_set_duty", 3, 3, NF_IDF_SET_DUTY, 'i', -1, false, 0, 0},
+  {"ledc_update_duty", 2, 2, NF_IDF_UPDATE_DUTY, 'i', -1, false, 0, 0},
+  {"ledc_set_duty_and_update", 4, 4, NF_IDF_SET_DUTY_UPDATE, 'i', -1, false, 0, 0},
+  {"ledc_set_duty_with_hpoint", 4, 4, NF_IDF_SET_DUTY_HPOINT, 'i', -1, false, 0, 0},
+  {"ledc_get_duty", 2, 2, NF_IDF_GET_DUTY, 'i', -1, false, 0, 0},
+  {"ledc_get_hpoint", 2, 2, NF_IDF_GET_HPOINT, 'i', -1, false, 0, 0},
+  {"ledc_set_freq", 3, 3, NF_IDF_SET_FREQ, 'i', -1, false, 0, 0},
+  {"ledc_get_freq", 2, 2, NF_IDF_GET_FREQ, 'i', -1, false, 0, 0},
+  {"ledc_stop", 3, 3, NF_IDF_STOP, 'i', -1, false, 0, 0},
+  {"ledc_timer_pause", 2, 2, NF_IDF_TIMER_PAUSE, 'i', -1, false, 0, 0},
+  {"ledc_timer_resume", 2, 2, NF_IDF_TIMER_RESUME, 'i', -1, false, 0, 0},
+  {"ledc_timer_rst", 2, 2, NF_IDF_TIMER_RST, 'i', -1, false, 0, 0},
+  {"ledc_bind_channel_timer", 3, 3, NF_IDF_BIND, 'i', -1, false, 0, 0},
+  {"ledc_set_pin", 3, 3, NF_IDF_SET_PIN, 'i', 0, true, 0, 0},
+  {"ledc_fade_func_install", 1, 1, NF_IDF_FADE_INSTALL, 'i', -1, false, 0, 0},
+  {"ledc_fade_func_uninstall", 0, 0, NF_IDF_FADE_UNINSTALL, 'v', -1, false, 0, 0},
+  {"ledc_set_fade_with_time", 4, 4, NF_IDF_FADE_TIME, 'i', -1, false, 0, 0},
+  {"ledc_set_fade_with_step", 5, 5, NF_IDF_FADE_STEP, 'i', -1, false, 0, 0},
+  {"ledc_fade_start", 3, 3, NF_IDF_FADE_START, 'i', -1, false, 0, 0},
+  {"ledc_fade_stop", 2, 2, NF_IDF_FADE_STOP, 'i', -1, false, 0, 0},
+  {"ledc_set_fade_time_and_start", 5, 5, NF_IDF_FADE_TIME_START, 'i', -1, false, 0, 0},
+  {"ledc_set_fade_step_and_start", 6, 6, NF_IDF_FADE_STEP_START, 'i', -1, false, 0, 0},
+  {"ledc_find_suitable_duty_resolution", 2, 2, NF_IDF_FIND_RES, 'i', -1, false, 0, 0},
+  // ESP-IDF: driver/gpio.h
+  {"gpio_config", 1, 1, NF_IDF_GPIO_CONFIG, 'i', -1, false, XF_STRUCT, BS_GPIO_CONFIG},
+  {"gpio_set_level", 2, 2, NF_IDF_GPIO_SET_LEVEL, 'i', 0, true, 0, 0},
+  {"gpio_get_level", 1, 1, NF_IDF_GPIO_GET_LEVEL, 'i', 0, false, 0, 0},
+  {"gpio_set_direction", 2, 2, NF_IDF_GPIO_SET_DIR, 'i', 0, false, 0, 0},
+  {"gpio_reset_pin", 1, 1, NF_IDF_GPIO_RESET, 'i', 0, false, 0, 0},
+  {"gpio_set_pull_mode", 2, 2, NF_IDF_GPIO_PULL, 'i', 0, false, 0, 0},
+  {"gpio_pullup_en", 1, 1, NF_IDF_GPIO_PU_EN, 'i', 0, false, 0, 0},
+  {"gpio_pullup_dis", 1, 1, NF_IDF_GPIO_PU_DIS, 'i', 0, false, 0, 0},
+  {"gpio_pulldown_en", 1, 1, NF_IDF_GPIO_PD_EN, 'i', 0, false, 0, 0},
+  {"gpio_pulldown_dis", 1, 1, NF_IDF_GPIO_PD_DIS, 'i', 0, false, 0, 0},
+  // ESP-IDF / FreeRTOS: utilidades
+  {"ESP_ERROR_CHECK", 1, 1, XS_ESPCHECK, 'v', -1, false, 0, 0},
+  {"ESP_ERROR_CHECK_WITHOUT_ABORT", 1, 1, XS_ESPCHECK_NA, 'i', -1, false, 0, 0},
+  {"esp_err_to_name", 1, 1, XS_ERRNAME, 's', -1, false, 0, 0},
+  {"vTaskDelay", 1, 1, XS_VTASKDELAY, 'v', -1, false, 0, 0},
+  {"vTaskDelete", 1, 1, XS_NOOP, 'v', -1, false, 0, 0},
+  {"pdMS_TO_TICKS", 1, 1, XS_IDENT, 'i', -1, false, 0, 0},
+  {"pdTICKS_TO_MS", 1, 1, XS_IDENT, 'i', -1, false, 0, 0},
+  {"xTaskGetTickCount", 0, 0, XS_TICKS, 'i', -1, false, 0, 0},
+  {"esp_rom_delay_us", 1, 1, XS_DELAYUS, 'v', -1, false, 0, 0},
+  {"ets_delay_us", 1, 1, XS_DELAYUS, 'v', -1, false, 0, 0},
+  {"esp_restart", 0, 0, NF_ESP_RESTART, 'v', -1, false, 0, 0},
+  {"esp_get_free_heap_size", 0, 0, NF_ESP_FREEHEAP, 'i', -1, false, 0, 0},
+  {"printf", 1, MAX_ARGS, XS_PRINTF, 'i', -1, false, 0, 0},
+  {"ESP_LOGI", 2, MAX_ARGS, XS_LOG, 'v', -1, false, 0, 'I'},
+  {"ESP_LOGW", 2, MAX_ARGS, XS_LOG, 'v', -1, false, 0, 'W'},
+  {"ESP_LOGE", 2, MAX_ARGS, XS_LOG, 'v', -1, false, 0, 'E'},
+  {"ESP_LOGD", 2, MAX_ARGS, XS_LOG, 'v', -1, false, 0, 'D'},
+  {"ESP_LOGV", 2, MAX_ARGS, XS_LOG, 'v', -1, false, 0, 'V'},
+  {"memset", 3, 3, XS_MEMSET, 'v', -1, false, 0, 0},
+  {"BIT", 1, 1, XS_BIT, 'i', -1, false, 0, 0},
 };
 static const int kNativeCount = (int)(sizeof(kNatives) / sizeof(kNatives[0]));
 
@@ -943,6 +1015,11 @@ struct Impl {
   bool abort_;
   uint32_t steps;
   uint32_t rng;
+  // estructuras
+  struct StructField { int name; uint8_t ty; std::vector<int> dims; Node* def; };
+  struct StructDef { std::string name; std::vector<StructField> f; };
+  std::vector<StructDef> structs;
+  std::vector<std::string> names;
   // interrupciones diferidas: bit del evento -> funcion del programa
   int eventFunc[32];
   int eventMask;
@@ -963,6 +1040,8 @@ struct Impl {
     strConsts.clear();
     globalInits.clear();
     globalTys.clear();
+    structs.clear();
+    names.clear();
     arena.clear();
     setupIdx = loopIdx = -1;
     loaded = false;
@@ -1019,13 +1098,14 @@ struct Impl {
   const char* kindName(const Value& v) {
     switch (v.t) {
       case V_STR: return "un String";
-      case V_ARR: return "un array";
+      case V_ARR: return v.a->sid >= 0 ? "una estructura" : "un array";
       case V_VOID: return "un valor vacio (void)";
       case V_FUNC: return "una funcion";
       default: return "un numero";
     }
   }
   Value defaultValue(uint8_t ty) {
+    if (tyIsStruct(ty)) return makeStruct(ty - TY_STRUCT0, nullptr, 0);
     if (ty == TY_FLOAT || ty == TY_DOUBLE) return Value::F(0);
     if (ty == TY_STRING) return Value::S(std::string());
     return Value::I(0, ty == TY_CHAR);
@@ -1064,7 +1144,7 @@ struct Impl {
         snprintf(buf, sizeof buf, "%.*f", d, f);
         return buf;
       }
-      case V_ARR: return "[array]";
+      case V_ARR: return v.a->sid >= 0 ? "[estructura]" : "[array]";
       case V_FUNC: return "[funcion]";
       default: return "";
     }
@@ -1072,6 +1152,12 @@ struct Impl {
 
   Value coerce(Value v, uint8_t ty, int line) {
     if (v.t == V_REF) { Value d = *v.r; v = d; }
+    if (tyIsStruct(ty)) {   // las estructuras se copian (como en C)
+      int sid = ty - TY_STRUCT0;
+      if (v.t == V_ARR && v.a->sid == sid) return cloneVal(v);
+      fail(line, "se esperaba una estructura '%s' pero es %s", structs[sid].name.c_str(), kindName(v));
+      return Value();
+    }
     switch (ty) {
       case TY_ANY:
       case TY_VOID:
@@ -1098,6 +1184,57 @@ struct Impl {
     else fail(line, "se esperaba un numero pero es %s", kindName(v));
     return Value();
   }
+
+  // ---- estructuras ----
+  int intern(const std::string& s) {
+    for (size_t k = 0; k < names.size(); k++)
+      if (names[k] == s) return (int)k;
+    names.push_back(s);
+    return (int)names.size() - 1;
+  }
+  int fieldIndex(int sid, int nameId) {
+    const StructDef& d = structs[sid];
+    for (size_t k = 0; k < d.f.size(); k++)
+      if (d.f[k].name == nameId) return (int)k;
+    return -1;
+  }
+  int addStruct(const char* name, const char* const* fields, const uint8_t* tys, int n) {
+    StructDef d;
+    d.name = name;
+    for (int k = 0; k < n; k++) {
+      StructField f;
+      f.name = intern(fields[k]);
+      f.ty = tys[k];
+      f.def = nullptr;
+      d.f.push_back(f);
+    }
+    structs.push_back(d);
+    return (int)structs.size() - 1;
+  }
+  void addBuiltinStructs() {
+    static const char* const fl[] = {"output_invert"};
+    static const uint8_t flt[] = {TY_U32};
+    addStruct("ledc_channel_flags", fl, flt, 1);
+    static const char* const tm[] = {"speed_mode", "duty_resolution", "timer_num", "freq_hz", "clk_cfg", "deconfigure"};
+    static const uint8_t tmt[] = {TY_I32, TY_I32, TY_I32, TY_U32, TY_I32, TY_BOOL};
+    addStruct("ledc_timer_config_t", tm, tmt, 6);
+    static const char* const ch[] = {"gpio_num", "speed_mode", "channel", "intr_type", "timer_sel", "duty", "hpoint",
+                                     "sleep_mode", "flags"};
+    static const uint8_t cht[] = {TY_I32, TY_I32, TY_I32, TY_I32, TY_I32, TY_U32, TY_I32, TY_I32,
+                                  (uint8_t)(TY_STRUCT0 + BS_LEDC_FLAGS)};
+    addStruct("ledc_channel_config_t", ch, cht, 9);
+    static const char* const gp[] = {"pin_bit_mask", "mode", "pull_up_en", "pull_down_en", "intr_type"};
+    static const uint8_t gpt[] = {TY_U64, TY_I32, TY_I32, TY_I32, TY_I32};
+    addStruct("gpio_config_t", gp, gpt, 5);
+  }
+  Value makeStruct(int sid, Node* init, int line);
+  Value fieldValue(const StructField& f, Node* val, int line);
+  Value cloneVal(const Value& v);
+  int64_t tyBytes(uint8_t ty);
+  Value* fieldOf(const Value& base, Node* n, uint8_t& ty);
+  Value evalField(Node* n) NOINLINE;
+  void fillValue(Value& v, uint8_t ty, int64_t b);
+  bool flatten(const Value& v, double* args, int& k, int max, int line);
 
   // ---- ejecucion ----
   Value eval(Node* n);
@@ -1290,8 +1427,10 @@ private:
   // declaraciones
   bool parseTopLevel();
   bool parseFunction(uint8_t retTy, const std::string& name, int line);
-  bool parseEnum(bool global);
+  bool parseEnum(bool global, bool typeOnly = false);
   bool parseTypedef();
+  Node* parseStructDef(bool global, bool typeOnly, uint8_t& tyOut);
+  void registerIdfTypes();
   Node* parseDeclRest(uint8_t ty, bool isStatic, const std::string& firstName, int firstLine, bool global);
   Node* parseDeclarator(uint8_t ty, bool isStatic, const std::string& name, int line, bool global);
   Node* parseInitList();
@@ -1317,7 +1456,7 @@ private:
   Node* parseArgs(int& argc);
   Node* parseIdentifier(const Token& t);
   static int binPrec(const Token& t);
-  bool isLvalue(Node* n) { return n && (n->kind == N_LVAR || n->kind == N_GVAR || n->kind == N_INDEX); }
+  bool isLvalue(Node* n) { return n && (n->kind == N_LVAR || n->kind == N_GVAR || n->kind == N_INDEX || n->kind == N_FIELD); }
   static uint8_t staticType(Node* n) {
     if (!n) return TY_ANY;
     if (n->kind == N_LVAR || n->kind == N_GVAR) return n->op;
@@ -1341,7 +1480,7 @@ bool Parser::isTypeWord(const std::string& s) {
     "void", "bool", "boolean", "char", "byte", "short", "int", "long", "unsigned", "signed", "float",
     "double", "String", "size_t", "uint8_t", "int8_t", "uint16_t", "int16_t", "uint32_t", "int32_t",
     "uint64_t", "int64_t", "word", "auto", "const", "constexpr", "static", "volatile", "inline", "extern",
-    "register", "Servo", "SPISettings", "hw_timer_t", "portMUX_TYPE", "esp_timer_handle_t", nullptr};
+    "register", "Servo", "SPISettings", "hw_timer_t", "portMUX_TYPE", "esp_timer_handle_t", "struct", nullptr};
   for (int k = 0; words[k]; k++)
     if (s == words[k]) return true;
   return typeAliases.count(s) > 0;
@@ -1372,6 +1511,7 @@ int Parser::parseType(bool& isStatic, bool& isConst, bool allowRef, bool& isRef)
     if (s == "const" || s == "constexpr") { isConst = true; skip(); continue; }
     if (s == "static") { isStatic = true; skip(); continue; }
     if (s == "volatile" || s == "inline" || s == "extern" || s == "register") { skip(); continue; }
+    if (s == "struct" && base < 0 && count == 0) { skip(); continue; }   // struct Nombre x;
     if (s == "unsigned") { uns = true; skip(); count++; continue; }
     if (s == "signed") { sgn = true; skip(); count++; continue; }
     if (s == "long") { longs++; skip(); count++; continue; }
@@ -1428,7 +1568,21 @@ int Parser::parseType(bool& isStatic, bool& isConst, bool allowRef, bool& isRef)
   return ty;
 }
 
+void Parser::registerIdfTypes() {
+  static const char* const ints[] = {
+    "esp_err_t", "ledc_mode_t", "ledc_timer_t", "ledc_channel_t", "ledc_timer_bit_t", "ledc_clk_cfg_t",
+    "ledc_intr_type_t", "ledc_fade_mode_t", "ledc_duty_direction_t", "ledc_sleep_mode_t", "ledc_clk_src_t",
+    "gpio_num_t", "gpio_mode_t", "gpio_pullup_t", "gpio_pulldown_t", "gpio_int_type_t", "gpio_pull_mode_t",
+    "gpio_drive_cap_t", "BaseType_t", "note_t", "adc_attenuation_t", "dac_channel_t", "TaskHandle_t", nullptr};
+  for (int k = 0; ints[k]; k++) typeAliases[ints[k]] = TY_I32;
+  static const char* const uns[] = {"TickType_t", "UBaseType_t", "uint", nullptr};
+  for (int k = 0; uns[k]; k++) typeAliases[uns[k]] = TY_U32;
+  P.addBuiltinStructs();
+  for (size_t k = 0; k < P.structs.size(); k++) typeAliases[P.structs[k].name] = (uint8_t)(TY_STRUCT0 + k);
+}
+
 bool Parser::parseProgram() {
+  registerIdfTypes();
   while (!failed) {
     const Token& t = peek();
     if (t.type == TK_EOF) break;
@@ -1440,6 +1594,10 @@ bool Parser::parseProgram() {
   for (size_t k = 0; k < P.funcs.size(); k++) {
     if (P.funcs[k].name == "setup" && P.funcs[k].defined) P.setupIdx = (int)k;
     if (P.funcs[k].name == "loop" && P.funcs[k].defined) P.loopIdx = (int)k;
+  }
+  if (P.setupIdx < 0 && P.loopIdx < 0) {   // programa de ESP-IDF: app_main() hace de setup()
+    for (size_t k = 0; k < P.funcs.size(); k++)
+      if (P.funcs[k].name == "app_main" && P.funcs[k].defined) P.setupIdx = (int)k;
   }
   if (P.setupIdx < 0 && P.loopIdx < 0) {
     failAt(1, "el programa necesita una funcion setup() o loop()");
@@ -1455,7 +1613,21 @@ bool Parser::parseTopLevel() {
     if (t.text == "enum") return parseEnum(true);
     if (t.text == "typedef") return parseTypedef();
     if (t.text == "using") { while (!isOp(';') && peek().type != TK_EOF) skip(); skip(); return true; }
-    if (t.text == "struct" || t.text == "class" || t.text == "union" || t.text == "template" || t.text == "namespace") {
+    if (t.text == "extern" && peek(1).type == TK_STRING) {   // extern "C" void app_main(void)
+      skip();
+      skip();
+      if (isOp('{')) { failAt(t.line, "extern \"C\" { ... } no esta soportado; quitalo"); return false; }
+      return true;
+    }
+    if (t.text == "struct" && (isOp('{', 1) || (peek(1).type == TK_IDENT && isOp('{', 2)))) {
+      uint8_t sty;
+      return parseStructDef(true, false, sty) != nullptr && !failed;
+    }
+    if (t.text == "struct" && peek(1).type == TK_IDENT && isOp(';', 2)) {   // declaracion adelantada
+      skip(); skip(); skip();
+      return true;
+    }
+    if (t.text == "class" || t.text == "union" || t.text == "template" || t.text == "namespace") {
       failAt(t.line, "'%s' no esta soportado por el interprete", t.text.c_str());
       return false;
     }
@@ -1595,7 +1767,7 @@ bool Parser::foldConst(Node* n, int64_t& out) {
   }
 }
 
-bool Parser::parseEnum(bool global) {
+bool Parser::parseEnum(bool global, bool typeOnly) {
   (void)global;
   int line = takeLine();  // enum
   if (isIdent("class") || isIdent("struct")) skip();
@@ -1619,21 +1791,104 @@ bool Parser::parseEnum(bool global) {
     if (!acceptOp(',')) break;
   }
   if (!expectOp('}')) return false;
+  if (typeOnly) return true;
   if (peek().type == TK_IDENT) { failAt(line, "declarar variables en la misma linea del enum no esta soportado"); return false; }
   return expectOp(';');
 }
 
+// struct Nombre { tipo campo; ... } [variables];
+Node* Parser::parseStructDef(bool global, bool typeOnly, uint8_t& tyOut) {
+  int line = takeLine();  // struct
+  std::string name;
+  if (peek().type == TK_IDENT) name = take().text;
+  if (!name.empty() && typeAliases.count(name)) { failAt(line, "el tipo '%s' ya existe", name.c_str()); return nullptr; }
+  if (!expectOp('{')) return nullptr;
+  Impl::StructDef sd;
+  sd.name = name.empty() ? "(struct sin nombre)" : name;
+  while (!failed && !isOp('}')) {
+    if (peek().type == TK_EOF) { failAt(line, "falta '}' para cerrar el struct"); return nullptr; }
+    if ((isIdent("public") || isIdent("private") || isIdent("protected")) && isOp(':', 1)) { skip(); skip(); continue; }
+    uint8_t fty;
+    if (isIdent("struct") && (isOp('{', 1) || (peek(1).type == TK_IDENT && isOp('{', 2)))) {
+      if (!parseStructDef(global, true, fty)) return nullptr;   // struct anidado: struct { ... } flags;
+    } else {
+      bool st, cn, rf;
+      fty = (uint8_t)parseType(st, cn, false, rf);
+      if (failed) return nullptr;
+      if (fty == TY_VOID) { failAt(peek().line, "un campo no puede ser void"); return nullptr; }
+    }
+    for (;;) {
+      std::string fname;
+      int fl = peek().line;
+      if (!expectIdent(fname)) return nullptr;
+      if (isOp('(')) { failAt(fl, "las funciones dentro de un struct no estan soportadas (escribelas fuera)"); return nullptr; }
+      Impl::StructField f;
+      f.name = P.intern(fname);
+      f.ty = fty;
+      f.def = nullptr;
+      for (size_t k = 0; k < sd.f.size(); k++)
+        if (sd.f[k].name == f.name) { failAt(fl, "el campo '%s' esta repetido", fname.c_str()); return nullptr; }
+      while (acceptOp('[')) {
+        Node* e = parseExpr();
+        if (failed) return nullptr;
+        int64_t v;
+        if (!foldConst(e, v) || v <= 0 || v > MAX_ARRAY_ELEMS) { failAt(fl, "el tamano de '%s[]' debe ser un numero constante", fname.c_str()); return nullptr; }
+        f.dims.push_back((int)v);
+        if (!expectOp(']')) return nullptr;
+      }
+      if (acceptOp(':')) { parseTernary(); if (failed) return nullptr; }   // campo de bits: se guarda entero
+      if (acceptOp('=')) f.def = isOp('{') ? parseInitList() : parseAssign();
+      else if (isOp('{')) f.def = parseInitList();
+      if (failed) return nullptr;
+      sd.f.push_back(f);
+      if (!acceptOp(',')) break;
+    }
+    if (!expectOp(';')) return nullptr;
+  }
+  if (!expectOp('}')) return nullptr;
+  if (sd.f.empty()) { failAt(line, "el struct no tiene campos"); return nullptr; }
+  if (P.structs.size() >= 200) { failAt(line, "demasiados tipos struct"); return nullptr; }
+  P.structs.push_back(sd);
+  uint8_t ty = (uint8_t)(TY_STRUCT0 + P.structs.size() - 1);
+  if (!name.empty()) typeAliases[name] = ty;
+  tyOut = ty;
+  Node* none = mk(N_EMPTY, line);
+  if (typeOnly) return none;
+  if (peek().type == TK_IDENT) {   // struct Punto { ... } p1, p2;
+    int vl = peek().line;
+    std::string vn = take().text;
+    return parseDeclRest(ty, false, vn, vl, global);
+  }
+  if (!expectOp(';')) return nullptr;
+  return none;
+}
+
 bool Parser::parseTypedef() {
   int line = takeLine();
-  if (isIdent("struct") || isIdent("union") || isIdent("enum")) {
-    failAt(line, "typedef de struct/enum no esta soportado");
+  int ty;
+  if (isIdent("struct") && (isOp('{', 1) || (peek(1).type == TK_IDENT && isOp('{', 2)))) {
+    uint8_t sty;
+    if (!parseStructDef(true, true, sty)) return false;
+    ty = sty;
+  } else if (isIdent("enum")) {
+    if (!parseEnum(true, true)) return false;
+    ty = TY_I32;
+  } else if (isIdent("union")) {
+    failAt(line, "union no esta soportado");
     return false;
+  } else {
+    bool a, b, c;
+    ty = parseType(a, b, false, c);
+    if (failed) return false;
   }
-  bool a, b, c;
-  int ty = parseType(a, b, false, c);
-  std::string nm;
-  if (!expectIdent(nm)) return false;
-  typeAliases[nm] = (uint8_t)ty;
+  for (;;) {
+    bool ptr = false;
+    while (isOp('*')) { skip(); ptr = true; }
+    std::string nm;
+    if (!expectIdent(nm)) return false;
+    typeAliases[nm] = ptr ? (uint8_t)TY_ANY : (uint8_t)ty;
+    if (!acceptOp(',')) break;
+  }
   return expectOp(';');
 }
 
@@ -1645,7 +1900,33 @@ Node* Parser::parseInitList() {
   Node** tail = &list->a;
   int count = 0;
   while (!failed && !isOp('}')) {
-    Node* e = isOp('{') ? parseInitList() : parseAssign();
+    Node* e;
+    if (isOp('.') && peek(1).type == TK_IDENT) {   // .campo = valor
+      int dl = peek().line;
+      skip();
+      e = mk(N_DESIG, dl);
+      if (!e) return nullptr;
+      e->idx = P.intern(take().text);
+      Node* cur = e;
+      while (isOp('.') && peek(1).type == TK_IDENT) {   // .flags.output_invert = 1
+        skip();
+        Node* lst = mk(N_INITLIST, dl);
+        Node* d2 = mk(N_DESIG, dl);
+        if (!lst || !d2) return nullptr;
+        d2->idx = P.intern(take().text);
+        lst->a = d2;
+        lst->ival = 1;
+        cur->a = lst;
+        cur = d2;
+      }
+      if (!expectOp('=')) return nullptr;
+      cur->a = isOp('{') ? parseInitList() : parseAssign();
+    } else if (isOp('[')) {
+      failAt(peek().line, "los inicializadores [n] = valor no estan soportados");
+      return nullptr;
+    } else {
+      e = isOp('{') ? parseInitList() : parseAssign();
+    }
     if (failed) return nullptr;
     *tail = e;
     tail = &e->next;
@@ -1924,7 +2205,11 @@ Node* Parser::parseStatement() {
     if (s == "enum") { parseEnum(false); return failed ? nullptr : mk(N_EMPTY, line); }
     if (s == "typedef") { parseTypedef(); return failed ? nullptr : mk(N_EMPTY, line); }
     if (s == "goto") { failAt(line, "'goto' no esta soportado"); return nullptr; }
-    if (s == "struct" || s == "class") { failAt(line, "'%s' no esta soportado por el interprete", s.c_str()); return nullptr; }
+    if (s == "struct" && (isOp('{', 1) || (peek(1).type == TK_IDENT && isOp('{', 2)))) {
+      uint8_t sty;
+      return parseStructDef(false, false, sty);
+    }
+    if (s == "class") { failAt(line, "'class' no esta soportado por el interprete (usa struct)"); return nullptr; }
     if (isDeclStart()) {
       bool isStatic, isConst, isRef;
       int ty = parseType(isStatic, isConst, false, isRef);
@@ -2168,6 +2453,14 @@ Node* Parser::parsePostfix(Node* e) {
       std::string mname;
       if (!expectIdent(mname)) return nullptr;
       if (undeclared(e, line)) return nullptr;
+      if (!isOp('(')) {   // campo de una estructura: x.campo
+        Node* n = mk(N_FIELD, line);
+        if (!n) return nullptr;
+        n->a = e;
+        n->idx = P.intern(mname);
+        e = n;
+        continue;
+      }
       if (staticType(e) == TY_SERVO) {
         std::string full = "Servo." + mname;
         if (findBuiltin(full) < 0) { failAt(line, "Servo no tiene el metodo '.%s()'", mname.c_str()); return nullptr; }
@@ -2209,6 +2502,60 @@ Node* Parser::parsePostfix(Node* e) {
       return nullptr;
     }
     return e;
+  }
+}
+
+// Constantes de ESP-IDF iguales en todos los chips (las que cambian las da el firmware)
+static bool numSuffix(const std::string& s, const char* pre, const char* post, int lo, int hi, int64_t& v) {
+  size_t lp = strlen(pre), lq = strlen(post);
+  if (s.size() <= lp + lq || s.compare(0, lp, pre) != 0 || s.compare(s.size() - lq, lq, post) != 0) return false;
+  int x = 0;
+  for (size_t k = lp; k < s.size() - lq; k++) {
+    if (!isdigit((unsigned char)s[k]) || x > 1000) return false;
+    x = x * 10 + (s[k] - '0');
+  }
+  if (x < lo || x > hi) return false;
+  v = x;
+  return true;
+}
+
+static bool idfConstant(const std::string& s, int64_t& v) {
+  struct C { const char* n; int64_t v; };
+  static const C tbl[] = {
+    {"LEDC_INTR_DISABLE", 0}, {"LEDC_INTR_FADE_END", 1}, {"LEDC_FADE_NO_WAIT", 0}, {"LEDC_FADE_WAIT_DONE", 1},
+    {"LEDC_DUTY_DIR_DECREASE", 0}, {"LEDC_DUTY_DIR_INCREASE", 1}, {"LEDC_SLEEP_MODE_NO_ALIVE_NO_PD", 0},
+    {"LEDC_SLEEP_MODE_NO_ALIVE_ALLOW_PD", 1}, {"LEDC_SLEEP_MODE_KEEP_ALIVE", 2},
+    {"ESP_OK", 0}, {"ESP_FAIL", -1}, {"ESP_ERR_NO_MEM", 0x101}, {"ESP_ERR_INVALID_ARG", 0x102},
+    {"ESP_ERR_INVALID_STATE", 0x103}, {"ESP_ERR_INVALID_SIZE", 0x104}, {"ESP_ERR_NOT_FOUND", 0x105},
+    {"ESP_ERR_NOT_SUPPORTED", 0x106}, {"ESP_ERR_TIMEOUT", 0x107},
+    {"GPIO_NUM_NC", -1}, {"GPIO_MODE_DISABLE", 0}, {"GPIO_MODE_INPUT", 1}, {"GPIO_MODE_OUTPUT", 2},
+    {"GPIO_MODE_OUTPUT_OD", 6}, {"GPIO_MODE_INPUT_OUTPUT_OD", 7}, {"GPIO_MODE_INPUT_OUTPUT", 3},
+    {"GPIO_PULLUP_DISABLE", 0}, {"GPIO_PULLUP_ENABLE", 1}, {"GPIO_PULLDOWN_DISABLE", 0}, {"GPIO_PULLDOWN_ENABLE", 1},
+    {"GPIO_INTR_DISABLE", 0}, {"GPIO_INTR_POSEDGE", 1}, {"GPIO_INTR_NEGEDGE", 2}, {"GPIO_INTR_ANYEDGE", 3},
+    {"GPIO_INTR_LOW_LEVEL", 4}, {"GPIO_INTR_HIGH_LEVEL", 5}, {"GPIO_PULLUP_ONLY", 0}, {"GPIO_PULLDOWN_ONLY", 1},
+    {"GPIO_PULLUP_PULLDOWN", 2}, {"GPIO_FLOATING", 3},
+    {"portTICK_PERIOD_MS", 1}, {"portTICK_RATE_MS", 1}, {"configTICK_RATE_HZ", 1000}, {"pdTRUE", 1},
+    {"pdFALSE", 0}, {"pdPASS", 1}, {"pdFAIL", 0}, {"portMAX_DELAY", 4294967295LL},
+    {"ESP_INTR_FLAG_LEVEL1", 2}, {"ESP_INTR_FLAG_LEVEL2", 4}, {"ESP_INTR_FLAG_LEVEL3", 8},
+    {"ESP_INTR_FLAG_SHARED", 256}, {"ESP_INTR_FLAG_IRAM", 1024}, {nullptr, 0}};
+  for (int k = 0; tbl[k].n; k++)
+    if (s == tbl[k].n) { v = tbl[k].v; return true; }
+  return numSuffix(s, "LEDC_CHANNEL_", "", 0, 7, v) || numSuffix(s, "LEDC_TIMER_", "_BIT", 1, 20, v) ||
+         numSuffix(s, "LEDC_TIMER_", "", 0, 3, v) || numSuffix(s, "GPIO_NUM_", "", 0, 56, v);
+}
+
+static const char* espErrName(int64_t c) {
+  switch (c) {
+    case 0: return "ESP_OK";
+    case -1: return "ESP_FAIL";
+    case 0x101: return "ESP_ERR_NO_MEM";
+    case 0x102: return "ESP_ERR_INVALID_ARG (algun valor no es valido)";
+    case 0x103: return "ESP_ERR_INVALID_STATE";
+    case 0x104: return "ESP_ERR_INVALID_SIZE";
+    case 0x105: return "ESP_ERR_NOT_FOUND";
+    case 0x106: return "ESP_ERR_NOT_SUPPORTED";
+    case 0x107: return "ESP_ERR_TIMEOUT";
+    default: return "ERROR";
   }
 }
 
@@ -2279,7 +2626,15 @@ Node* Parser::parseIdentifier(const Token& t) {
     }
   }
   {
-    int pc = P.hal.pinConstant(s);  // SDA, SCL, MOSI, DAC1...
+    int64_t cv;
+    if (idfConstant(s, cv)) {
+      Node* n = mk(N_NUM, line);
+      if (n) n->ival = cv;
+      return n;
+    }
+  }
+  {
+    int pc = P.hal.pinConstant(s);  // SDA, SCL, MOSI, DAC1, LEDC_LOW_SPEED_MODE...
     if (pc >= 0) {
       Node* n = mk(N_NUM, line);
       if (n) n->ival = pc;
@@ -2586,6 +2941,14 @@ Value* Impl::lref(Node* n, uint8_t& ty) {
       lrefHold = std::move(base);
       return &arr->v[(size_t)i];
     }
+    case N_FIELD: {
+      Value base = eval(n->a);
+      if (abort_) return nullptr;
+      Value* p = fieldOf(base, n, ty);
+      if (!p) return nullptr;
+      lrefHold = std::move(base);
+      return p;
+    }
     default:
       fail(n->line, "no se puede asignar a esta expresion");
       return nullptr;
@@ -2675,7 +3038,10 @@ Value Impl::assign(Node* n) {
   uint8_t ty;
   Value* dst = lref(n->a, ty);
   if (!dst) return Value();
-  if (dst->t == V_ARR) { fail(n->line, "no se puede asignar un array completo; asigna elemento a elemento"); return Value(); }
+  if (dst->t == V_ARR && !(dst->a->sid >= 0 && n->op == '=')) {
+    fail(n->line, dst->a->sid >= 0 ? "con una estructura solo se puede usar '='" : "no se puede asignar un array completo; asigna elemento a elemento");
+    return Value();
+  }
   if (n->op == '=') {
     *dst = coerce(std::move(rhs), ty, n->line);
     return *dst;
@@ -2712,9 +3078,148 @@ Value Impl::incdec(Node* n) {
 }
 
 int64_t Impl::arrBytes(ArrObj* a) {
+  if (a->sid >= 0) return tyBytes((uint8_t)(TY_STRUCT0 + a->sid));
   if (a->v.empty()) return 0;
   if (a->v[0].t == V_ARR) return (int64_t)a->v.size() * arrBytes(a->v[0].a);
-  return (int64_t)a->v.size() * kTySize[a->elemTy];
+  return (int64_t)a->v.size() * tyBytes(a->elemTy);
+}
+
+int64_t Impl::tyBytes(uint8_t ty) {
+  if (tyIsStruct(ty)) {
+    int64_t total = 0;
+    const StructDef& d = structs[ty - TY_STRUCT0];
+    for (size_t k = 0; k < d.f.size(); k++) {
+      int64_t m = 1;
+      for (size_t q = 0; q < d.f[k].dims.size(); q++) m *= d.f[k].dims[q];
+      total += m * tyBytes(d.f[k].ty);
+    }
+    return total;
+  }
+  return ty < TY__COUNT ? kTySize[ty] : 4;
+}
+
+Value* Impl::fieldOf(const Value& base, Node* n, uint8_t& ty) {
+  if (base.t != V_ARR || base.a->sid < 0) {
+    const char* f = names[n->idx].c_str();
+    if (base.t == V_STR) fail(n->line, "'.%s' es un metodo de String: escribe .%s()", f, f);
+    else fail(n->line, "'.%s' se usa sobre algo que no es una estructura", f);
+    return nullptr;
+  }
+  int sid = base.a->sid;
+  int fi;
+  if (n->op == (uint8_t)(sid + 1)) {
+    fi = (int)n->ival;
+  } else {
+    fi = fieldIndex(sid, n->idx);
+    if (fi < 0) {
+      fail(n->line, "'%s' no tiene el campo '%s'", structs[sid].name.c_str(), names[n->idx].c_str());
+      return nullptr;
+    }
+    n->op = (uint8_t)(sid + 1);
+    n->ival = fi;
+  }
+  const StructField& f = structs[sid].f[(size_t)fi];
+  ty = f.dims.empty() ? f.ty : (uint8_t)TY_ANY;
+  return &base.a->v[(size_t)fi];
+}
+
+Value Impl::evalField(Node* n) {
+  Value base = eval(n->a);
+  if (abort_) return Value();
+  uint8_t ty;
+  Value* p = fieldOf(base, n, ty);
+  if (!p) return Value();
+  return *p;
+}
+
+Value Impl::cloneVal(const Value& v) {
+  if (v.t != V_ARR) return v;
+  ArrObj* o = new ArrObj;
+  o->rc = 1;
+  o->elemTy = v.a->elemTy;
+  o->sid = v.a->sid;
+  o->v.resize(v.a->v.size());
+  Value out = Value::A(o);
+  for (size_t k = 0; k < v.a->v.size(); k++) o->v[k] = cloneVal(v.a->v[k]);
+  return out;
+}
+
+Value Impl::fieldValue(const StructField& f, Node* val, int line) {
+  if (!f.dims.empty()) {
+    if (val && val->kind != N_INITLIST && val->kind != N_STR) { fail(line, "un array se inicializa con { ... }"); return Value(); }
+    return makeArray(f.dims, 0, f.ty, val, line);
+  }
+  if (tyIsStruct(f.ty) && (!val || val->kind == N_INITLIST)) return makeStruct(f.ty - TY_STRUCT0, val, line);
+  if (!val) return defaultValue(f.ty);
+  if (val->kind == N_INITLIST) {   // int x = {5};
+    if (!val->a) return defaultValue(f.ty);
+    if (val->a->next) { fail(line, "sobran valores entre { }"); return Value(); }
+    val = val->a;
+  }
+  if (val->kind == N_DESIG) { fail(line, "'.%s =' sobra aqui", names[val->idx].c_str()); return Value(); }
+  Value v = eval(val);
+  if (abort_) return Value();
+  return coerce(std::move(v), f.ty, line);
+}
+
+Value Impl::makeStruct(int sid, Node* init, int line) {
+  ArrObj* o = new ArrObj;
+  o->rc = 1;
+  o->elemTy = TY_ANY;
+  o->sid = (int16_t)sid;
+  size_t nf = structs[sid].f.size();
+  o->v.resize(nf);
+  Value out = Value::A(o);
+  for (size_t k = 0; k < nf; k++) {
+    o->v[k] = fieldValue(structs[sid].f[k], structs[sid].f[k].def, line);
+    if (abort_) return Value();
+  }
+  if (!init) return out;
+  if (init->kind != N_INITLIST) { fail(line, "una estructura se inicializa con { ... }"); return Value(); }
+  size_t pos = 0;
+  for (Node* e = init->a; e; e = e->next) {
+    Node* val = e;
+    if (e->kind == N_DESIG) {
+      int fi = fieldIndex(sid, e->idx);
+      if (fi < 0) { fail(e->line, "'%s' no tiene el campo '%s'", structs[sid].name.c_str(), names[e->idx].c_str()); return Value(); }
+      pos = (size_t)fi;
+      val = e->a;
+    }
+    if (pos >= nf) { fail(line, "hay mas valores que campos en '%s'", structs[sid].name.c_str()); return Value(); }
+    o->v[pos] = fieldValue(structs[sid].f[pos], val, line);
+    if (abort_) return Value();
+    pos++;
+  }
+  return out;
+}
+
+void Impl::fillValue(Value& v, uint8_t ty, int64_t b) {
+  if (v.t == V_ARR) {
+    ArrObj* a = v.a;
+    for (size_t k = 0; k < a->v.size(); k++)
+      fillValue(a->v[k], a->sid >= 0 ? structs[a->sid].f[k].ty : a->elemTy, b);
+    return;
+  }
+  if (v.t == V_FLT) { v.f = 0; return; }
+  if (v.t == V_STR) { v = Value::S(std::string()); return; }
+  if (v.t == V_INT) {
+    int64_t x = b ? (int64_t)((uint64_t)b * 0x0101010101010101ULL) : 0;
+    v.i = (ty < TY__COUNT && tyIsInt(ty)) ? wrapInt(x, ty) : x;
+  }
+}
+
+bool Impl::flatten(const Value& v, double* args, int& k, int max, int line) {
+  for (size_t q = 0; q < v.a->v.size(); q++) {
+    const Value& e = v.a->v[q];
+    if (e.t == V_ARR && e.a->sid >= 0) {
+      if (!flatten(e, args, k, max, line)) return false;
+      continue;
+    }
+    if (!e.isNum()) { fail(line, "el campo '%s' debe ser un numero", names[structs[v.a->sid].f[q].name].c_str()); return false; }
+    if (k >= max) { fail(line, "estructura demasiado grande"); return false; }
+    args[k++] = num(e);
+  }
+  return true;
 }
 
 Value Impl::evalUnary(Node* n) {
@@ -2763,7 +3268,7 @@ Value Impl::evalCast(Node* n) {
     }
 
 Value Impl::evalSizeof(Node* n) {
-      if (!n->a) return Value::I(kTySize[n->op]);
+      if (!n->a) return Value::I(tyBytes(n->op));
       Node* x = n->a;
       Value v = eval(x);
       if (abort_) return Value();
@@ -2777,7 +3282,7 @@ Value Impl::evalSizeof(Node* n) {
         else if (b.t == V_STR) ty = TY_CHAR;
       }
       if (ty == TY_ANY) ty = v.t == V_FLT ? TY_DOUBLE : (v.t == V_STR ? TY_STRING : TY_I32);
-      return Value::I(kTySize[ty]);
+      return Value::I(tyBytes(ty));
     }
 
 Value Impl::eval(Node* n) {
@@ -2845,8 +3350,17 @@ Value Impl::eval(Node* n) {
       return Value();
     case N_FUNCREF:
       return Value::Fn(n->idx);
-    case N_ADDR:
-      fail(n->line, "los punteros (&x) no estan soportados; usa parametros por referencia");
+    case N_ADDR: {   // &estructura o &array: se pasa por referencia
+      Value v = eval(n->a);
+      if (abort_) return Value();
+      if (v.t == V_ARR) return v;
+      fail(n->line, "&x solo se admite con estructuras, arrays y funciones; para numeros usa parametros por referencia (int &x)");
+      return Value();
+    }
+    case N_FIELD:
+      return evalField(n);
+    case N_DESIG:
+      fail(n->line, "'.%s = ...' solo se puede usar dentro de { } al crear una estructura", names[n->idx].c_str());
       return Value();
     default:
       fail(n->line, "expresion no soportada");
@@ -2862,7 +3376,7 @@ bool Impl::bindArgs(Func& f, Node* args, int newfp, int line) {
     if (a) {
       if (p.isRef) {
         uint8_t ty;
-        if (a->kind != N_LVAR && a->kind != N_GVAR && a->kind != N_INDEX) {
+        if (a->kind != N_LVAR && a->kind != N_GVAR && a->kind != N_INDEX && a->kind != N_FIELD) {
           fail(a->line, "el parametro %d de '%s' es por referencia (&): pasa una variable", k + 1, f.name.c_str());
         } else {
           Value* r = lref(a, ty);
@@ -2948,6 +3462,9 @@ Value Impl::makeArray(const std::vector<int>& dims, size_t level, uint8_t ty, No
         if (sub->kind != N_INITLIST) { fail(line, "inicializador de array multidimensional mal formado"); return Value(); }
       }
       arr->v[(size_t)k] = makeArray(dims, level + 1, ty, sub, line);
+    } else if (e && e->kind == N_INITLIST && tyIsStruct(ty)) {
+      arr->v[(size_t)k] = makeStruct(ty - TY_STRUCT0, e, line);
+      e = e->next;
     } else if (e) {
       if (e->kind == N_INITLIST) { fail(line, "sobran llaves { } en el inicializador"); return Value(); }
       Value v = eval(e);
@@ -2982,6 +3499,13 @@ void Impl::execDecl(Node* n) {
     Value arr = makeArray(dims, 0, n->op, n->a, n->line);
     if (abort_) return;
     *slot = std::move(arr);
+    return;
+  }
+  if (tyIsStruct(n->op)) {
+    Node* init = n->a;
+    Value v = (!init || init->kind == N_INITLIST) ? makeStruct(n->op - TY_STRUCT0, init, n->line) : eval(init);
+    if (abort_) return;
+    *slot = (!init || init->kind == N_INITLIST) ? std::move(v) : coerce(std::move(v), n->op, n->line);
     return;
   }
   if (n->a) {
@@ -3568,6 +4092,50 @@ Value Impl::nativeCall(Node* n) {
   // funciones que resuelve el interprete
   switch (d.nf) {
     case XS_STR: return Value::S(hal.nativeStr(d.aux));
+    case XS_IDENT: return Value::I(asInt(av[0]));
+    case XS_BIT: return Value::I((int64_t)1 << (asInt(av[0]) & 63));
+    case XS_TICKS: return Value::I(hal.millis());
+    case XS_NOOP: return Value();
+    case XS_DELAYUS: hal.delayUs((uint32_t)asInt(av[0])); return Value();
+    case XS_VTASKDELAY: {
+      int64_t t = asInt(av[0]);
+      if (t <= 0) { hal.yield(); return Value(); }
+      sleepMs(t > 0xFFFFFFFFLL ? 0xFFFFFFFFu : (uint32_t)t);
+      return Value();
+    }
+    case XS_ESPCHECK: case XS_ESPCHECK_NA: {
+      int64_t code = av[0].isNum() ? asInt(av[0]) : 0;
+      if (code != 0) {
+        if (d.nf == XS_ESPCHECK) {
+          fail(line, "ESP_ERROR_CHECK: la funcion fallo con %s (0x%llx)", espErrName(code), (long long)code);
+          return Value();
+        }
+        out(std::string("ESP_ERROR_CHECK_WITHOUT_ABORT: ") + espErrName(code) + "\r\n");
+      }
+      return Value::I(code);
+    }
+    case XS_ERRNAME: {
+      std::string nm = espErrName(asInt(av[0]));
+      size_t sp = nm.find(' ');
+      return Value::S(sp == std::string::npos ? nm : nm.substr(0, sp));
+    }
+    case XS_PRINTF: case XS_LOG: {
+      int fa = d.nf == XS_LOG ? 1 : 0;
+      if (av[fa].t != V_STR) { fail(line, "%s necesita un texto de formato", d.name); return Value(); }
+      std::string txt = formatPrintf(av[fa].s->s, av + fa + 1, na - fa - 1, line);
+      if (abort_) return Value();
+      if (d.nf == XS_LOG) {
+        char head[64];
+        snprintf(head, sizeof head, "%c (%lu) %s: ", (char)d.aux, (unsigned long)hal.millis(), toStr(av[0]).c_str());
+        txt = head + txt + "\r\n";
+      }
+      out(txt);
+      return Value::I((int64_t)txt.size());
+    }
+    case XS_MEMSET:
+      if (av[0].t != V_ARR) { fail(line, "memset() solo funciona con estructuras y arrays: memset(&x, 0, sizeof(x))"); return Value(); }
+      fillValue(av[0], av[0].a->elemTy, asInt(av[1]) & 0xFF);
+      return Value();
     case XS_PIN2INT: return av[0];
     case XS_FMIN: case XS_FMAX: case XS_HYPOT: case XS_TRUNC: case XS_CBRT: {
       for (int k = 0; k < na; k++)
@@ -3709,8 +4277,8 @@ Value Impl::nativeCall(Node* n) {
     default:
       break;
   }
-  // llamada nativa normal: argumentos numericos
-  double args[MAX_ARGS + 2];
+  // llamada nativa normal: argumentos numericos (las estructuras se pasan campo a campo)
+  double args[MAX_ARGS + 24];
   int k = 0;
   if (d.flags & XF_BUS) args[k++] = n->op;
   Value* self = nullptr;
@@ -3726,6 +4294,18 @@ Value Impl::nativeCall(Node* n) {
     args[k++] = (double)h;
   }
   for (int q = 0; q < na; q++) {
+    if ((d.flags & XF_STRUCT) && av[q].t == V_ARR && av[q].a->sid >= 0) {
+      if (av[q].a->sid != d.aux) {
+        fail(line, "%s() necesita un %s y le pasas un %s", d.name, structs[d.aux].name.c_str(), structs[av[q].a->sid].name.c_str());
+        return Value();
+      }
+      if (!flatten(av[q], args, k, MAX_ARGS + 24, line)) return Value();
+      continue;
+    }
+    if (d.flags & XF_STRUCT) {
+      fail(line, "%s() necesita &variable de tipo %s", d.name, structs[d.aux].name.c_str());
+      return Value();
+    }
     if (!av[q].isNum()) {
       fail(line, "el argumento %d de %s() debe ser un numero pero es %s", q + 1, d.name, kindName(av[q]));
       return Value();

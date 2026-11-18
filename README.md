@@ -118,6 +118,23 @@ El ESP32 **recuerda el último programa** y lo ejecuta solo al encenderse. Si un
 | ADC | `analogReadMilliVolts`, `analogSetAttenuation(ADC_11db)`, `analogSetPinAttenuation`, `A0`…`A19` |
 | Sistema | `ESP.getChipModel()`, `getFreeHeap`, `getHeapSize`, `getCpuFreqMHz`, `getChipCores`, `getFlashChipSize`, `getEfuseMac`, `getSdkVersion`, `ESP.restart()`, `temperatureRead()`, `setCpuFrequencyMhz`, `esp_random()`, `esp_timer_get_time()`, `rgbLedWrite(pin, r, g, b)` |
 | Constantes | `SDA`, `SCL`, `MOSI`, `MISO`, `SCK`, `SS`, `TX`, `RX`, `DAC1`, `DAC2`, `LED_BUILTIN`, `RGB_BUILTIN`, `NOTE_C`…`NOTE_B` |
+| Más PWM (Arduino) | `ledcOutputInvert(pin, true)` (salida invertida), `sigmaDeltaAttach(pin, Hz)`, `sigmaDeltaWrite(pin, 0..255)`, `sigmaDeltaDetach` |
+
+### API de ESP‑IDF (código de bajo nivel de Espressif)
+
+También funciona el código escrito con la API de ESP‑IDF, que es la que suelen dar los ejemplos de Espressif y muchas respuestas de IA:
+
+- **`driver/ledc.h`**: `ledc_timer_config(&t)`, `ledc_channel_config(&c)` con sus estructuras `ledc_timer_config_t` y `ledc_channel_config_t` (también `.flags.output_invert` para señales invertidas y `hpoint` para desfasar), `ledc_set_duty`, `ledc_update_duty`, `ledc_set_duty_and_update`, `ledc_set_duty_with_hpoint`, `ledc_get_duty`, `ledc_set_freq`, `ledc_get_freq`, `ledc_stop`, `ledc_timer_pause/resume/rst`, `ledc_bind_channel_timer`, `ledc_set_pin`, `ledc_fade_func_install`, `ledc_set_fade_with_time`, `ledc_fade_start`… y todas las constantes `LEDC_*` (`LEDC_HIGH_SPEED_MODE` en el ESP32 clásico; en S3/C3/C6 se convierte sola en `LEDC_LOW_SPEED_MODE`).
+- **`driver/gpio.h`**: `gpio_config(&io)` con `gpio_config_t`, `gpio_set_level`, `gpio_get_level`, `gpio_set_direction`, `gpio_reset_pin`, `gpio_set_pull_mode`, `GPIO_NUM_x`, `GPIO_MODE_*`…
+- **Utilidades**: `ESP_ERROR_CHECK(...)` (si falla, la app te dice qué error y en qué línea), `esp_err_to_name`, `ESP_OK`/`ESP_ERR_*`, `printf`, `ESP_LOGI/W/E`, `vTaskDelay(pdMS_TO_TICKS(ms))`, `portTICK_PERIOD_MS`, `xTaskGetTickCount`, `esp_rom_delay_us`, `BIT(n)`, `memset(&x, 0, sizeof(x))`.
+- Un programa con `extern "C" void app_main(void)` (sin `setup`/`loop`) también vale: `app_main` hace de `setup()`.
+- **No mezcles** en el mismo programa `ledc_channel_config` con `ledcAttach`/`analogWrite`/`signalSquare`: las dos APIs usan los mismos canales del chip sin saberlo una de la otra.
+
+Ejemplos en la app: *PWM_Invertida_IDF* (dos señales de 1 kHz complementarias) y *PWM_Desfase_IDF* (tres fases desfasadas 120°).
+
+### Estructuras (`struct`)
+
+`struct Punto { int x; int y = 0; float peso; };`, `typedef struct { ... } Nombre;`, arrays dentro de estructuras, estructuras dentro de estructuras, arrays de estructuras, inicialización con `{1, 2}` o con `{ .x = 1, .y = 2 }`, `p.x = 5`, copiar con `=`, pasarlas a funciones (por valor, por referencia `Punto &p` o como puntero `&p`), devolverlas, `sizeof` y `typedef enum`.
 
 ### Señales de 1 kHz (y otras)
 
@@ -126,7 +143,7 @@ El ESP32 **recuerda el último programa** y lo ejecuta solo al encenderse. Si un
 - **Comprobarla sin osciloscopio:** une el pin de salida con otro pin y usa `frequencyRead(4, 1000)` (ejemplo *Senal1kHz*).
 - **Interrupciones de temporizador a 1 kHz:** funcionan (ejemplo *TimerInterrupcion*), pero ten en cuenta que en X‑RTbox la función de la interrupción la ejecuta el intérprete justo después de la instrucción en curso: no se pierde ninguna (si llegan varias seguidas se ejecuta una vez por cada una), pero puede retrasarse algunos microsegundos. **Para sacar una señal precisa usa `signalSquare`/`ledc`, no un `digitalWrite` dentro de la interrupción.**
 
-**No (de momento):** `WiFi.h`, `class`/`struct`, plantillas, punteros (`&x` fuera de los usos de arriba), `sprintf`/`strcpy`, modo esclavo I2C. La app avisa con un error claro y la línea.
+**No (de momento):** `WiFi.h`, `class` y funciones dentro de un `struct`, plantillas, punteros a números (`&x` solo con estructuras, arrays y funciones), `sprintf`/`strcpy`, modo esclavo I2C, tareas de FreeRTOS (`xTaskCreate`) y el MCPWM. La app avisa con un error claro y la línea.
 
 **Velocidad y tamaño:** al ser interpretado va bastante más lento que compilado (del orden de cientos de miles de instrucciones por segundo), de sobra para LEDs, botones, sensores, etc. Las señales (PWM, generadores, temporizadores) las saca el hardware del ESP32, así que no dependen de esa velocidad. Admite programas de hasta 32 KB. Los pines de la memoria flash (6‑11 en el ESP32 clásico) están protegidos.
 

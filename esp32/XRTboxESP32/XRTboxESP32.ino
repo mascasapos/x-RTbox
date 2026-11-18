@@ -42,6 +42,7 @@
 #include "esp_timer.h"
 #include "esp_idf_version.h"
 #include "esp32-hal-periman.h"
+#include "driver/ledc.h"
 #include <Wire.h>
 #include <SPI.h>
 #include "MiniC.h"
@@ -405,6 +406,8 @@ class EspHal : public minic::Hal {
   struct ServoCh { int8_t pin; uint16_t minUs, maxUs, us; };
   ServoCh servos[16];
   uint32_t slotUsed = 0;
+  uint32_t idfCh[2] = {0, 0};          // canales LEDC configurados con la API de ESP-IDF
+  bool idfFade = false;
   bool wireUsed[2] = {false, false};
   bool spiUsed = false;
   uint32_t bootCpuMhz = 0;
@@ -565,6 +568,31 @@ class EspHal : public minic::Hal {
     if (n == "SS") return SS;
     if (n == "TX") return TX;
     if (n == "RX") return RX;
+    // ESP-IDF: valores que cambian segun el chip
+    if (n == "LEDC_LOW_SPEED_MODE") return LEDC_LOW_SPEED_MODE;
+#if SOC_LEDC_SUPPORT_HS_MODE
+    if (n == "LEDC_HIGH_SPEED_MODE") return LEDC_HIGH_SPEED_MODE;
+#else
+    if (n == "LEDC_HIGH_SPEED_MODE") return LEDC_LOW_SPEED_MODE;   // este chip solo tiene el modo de baja velocidad
+#endif
+    if (n == "LEDC_SPEED_MODE_MAX") return LEDC_SPEED_MODE_MAX;
+    if (n == "LEDC_CHANNEL_MAX") return LEDC_CHANNEL_MAX;
+    if (n == "LEDC_TIMER_MAX") return LEDC_TIMER_MAX;
+    if (n == "LEDC_TIMER_BIT_MAX") return LEDC_TIMER_BIT_MAX;
+    if (n == "LEDC_AUTO_CLK") return (int)LEDC_AUTO_CLK;
+    if (n == "LEDC_USE_RC_FAST_CLK" || n == "LEDC_USE_RTC8M_CLK") return (int)LEDC_USE_RC_FAST_CLK;
+#if SOC_LEDC_SUPPORT_APB_CLOCK
+    if (n == "LEDC_USE_APB_CLK") return (int)LEDC_USE_APB_CLK;
+#endif
+#if SOC_LEDC_SUPPORT_REF_TICK
+    if (n == "LEDC_USE_REF_TICK") return (int)LEDC_USE_REF_TICK;
+#endif
+#if SOC_LEDC_SUPPORT_XTAL_CLOCK
+    if (n == "LEDC_USE_XTAL_CLK") return (int)LEDC_USE_XTAL_CLK;
+#endif
+#if SOC_LEDC_SUPPORT_PLL_DIV_CLOCK
+    if (n == "LEDC_USE_PLL_DIV_CLK") return (int)LEDC_USE_PLL_DIV_CLK;
+#endif
 #if CONFIG_IDF_TARGET_ESP32
     if (n == "DAC1") return 25;
     if (n == "DAC2") return 26;
@@ -774,6 +802,36 @@ class EspHal : public minic::Hal {
     if (d >= full) d = full;
     ::ledcWrite((uint8_t)pin, d);
     return (double)::ledcReadFreq((uint8_t)pin);
+  }
+
+  // ---- ESP-IDF ----
+  bool idfMode(int m) {
+    if (m >= 0 && m < LEDC_SPEED_MODE_MAX) return true;
+#if SOC_LEDC_SUPPORT_HS_MODE
+    nfail("speed_mode no valido: usa LEDC_LOW_SPEED_MODE o LEDC_HIGH_SPEED_MODE");
+#else
+    nfail("speed_mode no valido: usa LEDC_LOW_SPEED_MODE");
+#endif
+    return false;
+  }
+  bool idfChan(int c) {
+    if (c >= 0 && c < LEDC_CHANNEL_MAX) return true;
+    nfail("canal no valido (de LEDC_CHANNEL_0 a LEDC_CHANNEL_%d)", LEDC_CHANNEL_MAX - 1);
+    return false;
+  }
+  bool idfTimer(int t) {
+    if (t >= 0 && t < LEDC_TIMER_MAX) return true;
+    nfail("temporizador no valido (de LEDC_TIMER_0 a LEDC_TIMER_%d)", LEDC_TIMER_MAX - 1);
+    return false;
+  }
+  void idfEnsureFade() {
+    if (idfFade) return;
+    if (ledc_fade_func_install(0) == ESP_OK) idfFade = true;
+  }
+  void idfTakePin(int gpio, bool out) {   // el pin pasa a la API de ESP-IDF
+    stopDds(gpio);
+    releaseLedc(gpio);
+    if (out) markOut(gpio);
   }
 
   UserTimer* timerOf(double h) {
@@ -1285,6 +1343,189 @@ class EspHal : public minic::Hal {
         return ::setCpuFrequencyMhz((uint32_t)mhz);
       }
       case NF_ESP_RANDOM: return (double)esp_random();
+
+      // ---------------- extras de Arduino ----------------
+      case NF_LEDC_INVERT: {
+        int pin = (int)a[0];
+        if (!ledcBus(pin)) return nfail("el pin %d no tiene PWM: usa antes ledcAttach()", pin);
+        return ::ledcOutputInvert((uint8_t)pin, a[1] != 0);
+      }
+      case NF_SD_ATTACH: case NF_SD_WRITE: case NF_SD_DETACH: {
+        int pin = (int)a[0];
+#if SOC_SDM_SUPPORTED
+        if (fn == NF_SD_ATTACH) {
+          idfTakePin(pin, true);
+          if (!::sigmaDeltaAttach((uint8_t)pin, (uint32_t)a[1])) return nfail("no se pudo usar sigma-delta en el pin %d", pin);
+          return 1;
+        }
+        if (fn == NF_SD_WRITE) return ::sigmaDeltaWrite((uint8_t)pin, (uint8_t)((int)a[1] & 0xFF));
+        return ::sigmaDeltaDetach((uint8_t)pin);
+#else
+        (void)pin;
+        return nfail("este ESP32 no tiene modulador sigma-delta");
+#endif
+      }
+
+      // ---------------- ESP-IDF: driver/ledc.h ----------------
+      case NF_IDF_LEDC_TIMER: {
+        int mode = (int)a[0], res = (int)a[1], tmr = (int)a[2];
+        uint32_t f = (uint32_t)a[3];
+        bool deconf = n > 5 && a[5] != 0;
+        if (!idfMode(mode) || !idfTimer(tmr)) return 0;
+        if (!deconf && (res < 1 || res >= LEDC_TIMER_BIT_MAX))
+          return nfail("duty_resolution no valida (de LEDC_TIMER_1_BIT a LEDC_TIMER_%d_BIT)", LEDC_TIMER_BIT_MAX - 1);
+        if (!deconf && f < 1) return nfail("freq_hz debe ser mayor que 0");
+        ledc_timer_config_t c;
+        memset(&c, 0, sizeof c);
+        c.speed_mode = (ledc_mode_t)mode;
+        c.duty_resolution = (ledc_timer_bit_t)res;
+        c.timer_num = (ledc_timer_t)tmr;
+        c.freq_hz = f;
+        c.clk_cfg = (ledc_clk_cfg_t)(int)a[4];
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+        c.deconfigure = deconf;
+#endif
+        esp_err_t e = ledc_timer_config(&c);
+        if (e != ESP_OK && !deconf) {
+          char m[150];
+          int len = snprintf(m, sizeof m, "[X-RTbox] ledc_timer_config: no se pueden %lu Hz con %d bits (baja freq_hz o duty_resolution)\r\n",
+                             (unsigned long)f, res);
+          write(m, (size_t)len);
+        }
+        return (double)e;
+      }
+      case NF_IDF_LEDC_CHANNEL: {
+        int gpio = (int)a[0], mode = (int)a[1], ch = (int)a[2], tmr = (int)a[4];
+        if (!pinOk(gpio, true) || !idfMode(mode) || !idfChan(ch) || !idfTimer(tmr)) return 0;
+        idfTakePin(gpio, true);
+        ledc_channel_config_t c;
+        memset(&c, 0, sizeof c);
+        c.gpio_num = gpio;
+        c.speed_mode = (ledc_mode_t)mode;
+        c.channel = (ledc_channel_t)ch;
+        c.intr_type = (ledc_intr_type_t)(int)a[3];
+        c.timer_sel = (ledc_timer_t)tmr;
+        c.duty = (uint32_t)a[5];
+        c.hpoint = (int)a[6];
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+        c.sleep_mode = (ledc_sleep_mode_t)(int)a[7];
+#endif
+        c.flags.output_invert = a[8] != 0 ? 1 : 0;
+        esp_err_t e = ledc_channel_config(&c);
+        if (e == ESP_OK) idfCh[mode] |= 1u << ch;
+        return (double)e;
+      }
+      case NF_IDF_SET_DUTY: case NF_IDF_UPDATE_DUTY: case NF_IDF_SET_DUTY_UPDATE: case NF_IDF_SET_DUTY_HPOINT:
+      case NF_IDF_GET_DUTY: case NF_IDF_GET_HPOINT: case NF_IDF_STOP: case NF_IDF_FADE_TIME: case NF_IDF_FADE_STEP:
+      case NF_IDF_FADE_START: case NF_IDF_FADE_STOP: case NF_IDF_FADE_TIME_START: case NF_IDF_FADE_STEP_START: {
+        int mode = (int)a[0], ch = (int)a[1];
+        if (!idfMode(mode) || !idfChan(ch)) return 0;
+        ledc_mode_t M = (ledc_mode_t)mode;
+        ledc_channel_t C = (ledc_channel_t)ch;
+        switch (fn) {
+          case NF_IDF_SET_DUTY: return ledc_set_duty(M, C, (uint32_t)a[2]);
+          case NF_IDF_UPDATE_DUTY: return ledc_update_duty(M, C);
+          case NF_IDF_SET_DUTY_UPDATE: idfEnsureFade(); return ledc_set_duty_and_update(M, C, (uint32_t)a[2], (uint32_t)a[3]);
+          case NF_IDF_SET_DUTY_HPOINT: return ledc_set_duty_with_hpoint(M, C, (uint32_t)a[2], (uint32_t)a[3]);
+          case NF_IDF_GET_DUTY: return (double)ledc_get_duty(M, C);
+          case NF_IDF_GET_HPOINT: return ledc_get_hpoint(M, C);
+          case NF_IDF_STOP: return ledc_stop(M, C, (uint32_t)a[2]);
+          case NF_IDF_FADE_TIME: idfEnsureFade(); return ledc_set_fade_with_time(M, C, (uint32_t)a[2], (int)a[3]);
+          case NF_IDF_FADE_STEP: idfEnsureFade(); return ledc_set_fade_with_step(M, C, (uint32_t)a[2], (uint32_t)a[3], (uint32_t)a[4]);
+          case NF_IDF_FADE_START: idfEnsureFade(); return ledc_fade_start(M, C, (ledc_fade_mode_t)(int)a[2]);
+          case NF_IDF_FADE_STOP: return ledc_fade_stop(M, C);
+          case NF_IDF_FADE_TIME_START:
+            idfEnsureFade();
+            return ledc_set_fade_time_and_start(M, C, (uint32_t)a[2], (uint32_t)a[3], (ledc_fade_mode_t)(int)a[4]);
+          default:
+            idfEnsureFade();
+            return ledc_set_fade_step_and_start(M, C, (uint32_t)a[2], (uint32_t)a[3], (uint32_t)a[4], (ledc_fade_mode_t)(int)a[5]);
+        }
+      }
+      case NF_IDF_SET_FREQ: case NF_IDF_GET_FREQ: case NF_IDF_TIMER_PAUSE: case NF_IDF_TIMER_RESUME: case NF_IDF_TIMER_RST: {
+        int mode = (int)a[0], tmr = (int)a[1];
+        if (!idfMode(mode) || !idfTimer(tmr)) return 0;
+        ledc_mode_t M = (ledc_mode_t)mode;
+        ledc_timer_t T = (ledc_timer_t)tmr;
+        if (fn == NF_IDF_SET_FREQ) return ledc_set_freq(M, T, (uint32_t)a[2]);
+        if (fn == NF_IDF_GET_FREQ) return (double)ledc_get_freq(M, T);
+        if (fn == NF_IDF_TIMER_PAUSE) return ledc_timer_pause(M, T);
+        if (fn == NF_IDF_TIMER_RESUME) return ledc_timer_resume(M, T);
+        return ledc_timer_rst(M, T);
+      }
+      case NF_IDF_BIND: {
+        int mode = (int)a[0], ch = (int)a[1], tmr = (int)a[2];
+        if (!idfMode(mode) || !idfChan(ch) || !idfTimer(tmr)) return 0;
+        return ledc_bind_channel_timer((ledc_mode_t)mode, (ledc_channel_t)ch, (ledc_timer_t)tmr);
+      }
+      case NF_IDF_SET_PIN: {
+        int gpio = (int)a[0], mode = (int)a[1], ch = (int)a[2];
+        if (!idfMode(mode) || !idfChan(ch)) return 0;
+        idfTakePin(gpio, true);
+        esp_err_t e = ledc_set_pin(gpio, (ledc_mode_t)mode, (ledc_channel_t)ch);
+        if (e == ESP_OK) idfCh[mode] |= 1u << ch;
+        return e;
+      }
+      case NF_IDF_FADE_INSTALL: {
+        if (idfFade) return ESP_OK;
+        esp_err_t e = ledc_fade_func_install((int)a[0]);
+        if (e == ESP_OK) idfFade = true;
+        else if (e == ESP_ERR_INVALID_STATE) e = ESP_OK;   // ya estaba instalado
+        return e;
+      }
+      case NF_IDF_FADE_UNINSTALL:
+        if (idfFade) ledc_fade_func_uninstall();
+        idfFade = false;
+        return 0;
+      case NF_IDF_FIND_RES: {
+        uint32_t src = (uint32_t)a[0], f = (uint32_t)a[1];
+        if (!f || src < f) return 0;
+        uint32_t div = src / f;
+        int r = 31 - __builtin_clz(div);
+        if (r >= LEDC_TIMER_BIT_MAX) r = LEDC_TIMER_BIT_MAX - 1;
+        return r;
+      }
+
+      // ---------------- ESP-IDF: driver/gpio.h ----------------
+      case NF_IDF_GPIO_CONFIG: {
+        uint64_t mask = (uint64_t)a[0];
+        int mode = (int)a[1];
+        bool out = (mode & 2) != 0;
+        if (!mask) return nfail("pin_bit_mask esta vacio: usa (1ULL << pin)");
+        for (int pin = 0; pin < 64; pin++) {
+          if (!((mask >> pin) & 1)) continue;
+          if (!pinOk(pin, out)) return 0;
+          idfTakePin(pin, out);
+          ::pinMode(pin, out ? ((mode & 4) ? OUTPUT_OPEN_DRAIN : OUTPUT) : INPUT);   // para que digitalRead/Write tambien vayan
+        }
+        gpio_config_t c;
+        memset(&c, 0, sizeof c);
+        c.pin_bit_mask = mask;
+        c.mode = (gpio_mode_t)mode;
+        c.pull_up_en = (gpio_pullup_t)(int)a[2];
+        c.pull_down_en = (gpio_pulldown_t)(int)a[3];
+        c.intr_type = (gpio_int_type_t)(int)a[4];
+        return gpio_config(&c);
+      }
+      case NF_IDF_GPIO_SET_LEVEL:
+        markOut((int)a[0]);
+        return gpio_set_level((gpio_num_t)(int)a[0], a[1] != 0 ? 1 : 0);
+      case NF_IDF_GPIO_GET_LEVEL:
+        return gpio_get_level((gpio_num_t)(int)a[0]);
+      case NF_IDF_GPIO_SET_DIR: {
+        int pin = (int)a[0], mode = (int)a[1];
+        bool out = (mode & 2) != 0;
+        if (out && !pinOk(pin, true)) return 0;
+        idfTakePin(pin, out);
+        ::pinMode(pin, out ? ((mode & 4) ? OUTPUT_OPEN_DRAIN : OUTPUT) : INPUT);
+        return gpio_set_direction((gpio_num_t)pin, (gpio_mode_t)mode);
+      }
+      case NF_IDF_GPIO_RESET: idfTakePin((int)a[0], false); return gpio_reset_pin((gpio_num_t)(int)a[0]);
+      case NF_IDF_GPIO_PULL: return gpio_set_pull_mode((gpio_num_t)(int)a[0], (gpio_pull_mode_t)(int)a[1]);
+      case NF_IDF_GPIO_PU_EN: return gpio_pullup_en((gpio_num_t)(int)a[0]);
+      case NF_IDF_GPIO_PU_DIS: return gpio_pullup_dis((gpio_num_t)(int)a[0]);
+      case NF_IDF_GPIO_PD_EN: return gpio_pulldown_en((gpio_num_t)(int)a[0]);
+      case NF_IDF_GPIO_PD_DIS: return gpio_pulldown_dis((gpio_num_t)(int)a[0]);
       case NF_ESP_TIMER_US: return (double)esp_timer_get_time();
       default:
         return nfail("esta funcion no esta disponible en el firmware");
@@ -1328,6 +1569,13 @@ class EspHal : public minic::Hal {
     }
     if (spiUsed) SPI.end();
     spiUsed = false;
+    // canales LEDC configurados con la API de ESP-IDF
+    for (int m = 0; m < 2; m++)
+      for (int c = 0; c < 32; c++)
+        if (idfCh[m] & (1u << c)) ledc_stop((ledc_mode_t)m, (ledc_channel_t)c, 0);
+    idfCh[0] = idfCh[1] = 0;
+    if (idfFade) ledc_fade_func_uninstall();
+    idfFade = false;
 #if SOC_RMT_SUPPORTED
     for (int p = 0; p < 64; p++)
       if (rgbPins & (1ULL << p)) ::rgbLedWrite((uint8_t)p, 0, 0, 0);
