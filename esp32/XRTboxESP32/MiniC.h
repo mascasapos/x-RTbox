@@ -29,6 +29,42 @@ enum PinModeConst {
   MC_OUTPUT_OPEN_DRAIN = 0x13
 };
 
+// Funciones nativas del ESP32 (las implementa el firmware en Hal::native).
+// Los argumentos llegan como double y el resultado se devuelve como double.
+enum NativeFn {
+  NF_NONE = 0,
+  // PWM / LEDC
+  NF_LEDC_ATTACH, NF_LEDC_ATTACH_CH, NF_LEDC_SETUP, NF_LEDC_ATTACH_PIN, NF_LEDC_DETACH, NF_LEDC_WRITE,
+  NF_LEDC_TONE, NF_LEDC_NOTE, NF_LEDC_READ, NF_LEDC_READ_FREQ, NF_LEDC_CHANGE_FREQ, NF_LEDC_FADE,
+  NF_AW_FREQ, NF_AW_RES,
+  // generadores de senal (X-RTbox)
+  NF_SIG_SINE, NF_SIG_TRIANGLE, NF_SIG_SAW, NF_SIG_SQUARE, NF_SIG_STOP, NF_DAC_DISABLE,
+  // medida
+  NF_CNT_START, NF_CNT_READ, NF_CNT_RESET, NF_CNT_STOP, NF_PULSEIN_LONG,
+  // interrupciones y temporizadores (los avisos llegan por Hal::eventBits)
+  NF_PIN_EVENT_ATTACH, NF_PIN_EVENT_DETACH,
+  NF_TIMER_BEGIN, NF_TIMER_ATTACH, NF_TIMER_DETACH, NF_TIMER_ALARM, NF_TIMER_ALARM_WRITE,
+  NF_TIMER_ALARM_ENABLE, NF_TIMER_ALARM_DISABLE, NF_TIMER_START, NF_TIMER_STOP, NF_TIMER_RESTART,
+  NF_TIMER_END, NF_TIMER_READ, NF_TIMER_READ_US, NF_TIMER_READ_MS, NF_TIMER_READ_S, NF_TIMER_WRITE,
+  // I2C (primer argumento: bus 0 = Wire, 1 = Wire1)
+  NF_WIRE_BEGIN, NF_WIRE_END, NF_WIRE_CLOCK, NF_WIRE_GETCLOCK, NF_WIRE_BEGINTX, NF_WIRE_WRITE,
+  NF_WIRE_ENDTX, NF_WIRE_REQUEST, NF_WIRE_AVAILABLE, NF_WIRE_READ, NF_WIRE_PEEK,
+  // SPI
+  NF_SPI_BEGIN, NF_SPI_END, NF_SPI_BEGINTX, NF_SPI_ENDTX, NF_SPI_TRANSFER, NF_SPI_TRANSFER16,
+  NF_SPI_TRANSFER32, NF_SPI_FREQ, NF_SPI_MODE, NF_SPI_ORDER, NF_SPI_WRITE, NF_SPI_WRITE16, NF_SPI_WRITE32,
+  // Servo (primer argumento: identificador del servo)
+  NF_SERVO_ATTACH, NF_SERVO_WRITE, NF_SERVO_WRITE_US, NF_SERVO_READ, NF_SERVO_READ_US,
+  NF_SERVO_ATTACHED, NF_SERVO_DETACH,
+  // sistema
+  NF_ESP_RESTART, NF_ESP_FREEHEAP, NF_ESP_HEAPSIZE, NF_ESP_CPUFREQ, NF_ESP_CORES, NF_ESP_FLASHSIZE,
+  NF_ESP_MAC, NF_TEMPERATURE, NF_AREAD_MV, NF_ASET_ATTEN, NF_ASET_PIN_ATTEN, NF_RGBLED,
+  NF_SET_CPUFREQ, NF_ESP_RANDOM, NF_ESP_TIMER_US,
+  NF__COUNT
+};
+
+// Funciones nativas que devuelven texto (Hal::nativeStr)
+enum NativeStrFn { NS_CHIP_MODEL = 1, NS_SDK_VERSION };
+
 // Capa de acceso al hardware. El firmware del ESP32 la implementa con las
 // funciones reales de Arduino; los tests de PC la implementan simulada.
 class Hal {
@@ -63,6 +99,24 @@ public:
   virtual const char* pinError(int pin, bool output) { (void)pin; (void)output; return nullptr; }
   virtual uint32_t entropy() { return 0x12345678u; }
   virtual int ledBuiltin() { return 2; }
+  // Nombres de pines de la placa (SDA, SCL, MOSI, DAC1...). -1 si no existe.
+  virtual int pinConstant(const std::string& name) { (void)name; return -1; }
+
+  // Interrupciones y temporizadores: el firmware pone a 1 el bit del evento
+  // (desde una interrupcion) y el interprete llama a la funcion del programa.
+  volatile uint32_t eventBits = 0;
+  virtual uint32_t takeEvents() { uint32_t b = eventBits; eventBits = 0; return b; }
+  // Cuantas veces ha ocurrido el evento desde la ultima consulta (0 = ninguna).
+  virtual uint32_t takeEventCount(int slot) { (void)slot; return 1; }
+
+  // Funciones nativas. Si algo falla, el firmware deja el motivo en nativeError.
+  std::string nativeError;
+  virtual double native(int fn, const double* a, int argc) {
+    (void)fn; (void)a; (void)argc;
+    nativeError = "esta funcion no esta disponible aqui";
+    return 0;
+  }
+  virtual std::string nativeStr(int fn) { (void)fn; return std::string(); }
 };
 
 enum RunResult { RUN_OK = 0, RUN_ERROR, RUN_STOPPED, RUN_FINISHED };

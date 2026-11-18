@@ -19,7 +19,10 @@ python3 -m pip install --quiet --break-system-packages esptool 2>/dev/null || py
 build() {  # $1 nombre, $2 fqbn, $3 direccion del bootloader
   local name="$1" fqbn="$2" boot="$3" dir="build/$1"
   echo "::group::Firmware $name"
-  if arduino-cli compile --fqbn "$fqbn" --output-dir "$dir" --additional-urls "$URL" esp32/XRTboxESP32; then
+  mkdir -p "$dir"
+  local log="$dir/compilacion.log"
+  if arduino-cli compile --fqbn "$fqbn" --output-dir "$dir" --additional-urls "$URL" --warnings default esp32/XRTboxESP32 > "$log" 2>&1; then
+    tail -n 15 "$log"
     local merged
     merged=$(ls "$dir"/*.merged.bin 2>/dev/null | head -1)
     if [ -z "$merged" ]; then
@@ -39,6 +42,13 @@ build() {  # $1 nombre, $2 fqbn, $3 direccion del bootloader
       echo "::warning::No se pudo generar la imagen completa del firmware $name"
     fi
   else
+    cat "$log"
+    # los errores del compilador salen como anotaciones (se leen sin entrar al registro)
+    grep -E "error:|Error:|error de|undefined reference" "$log" | head -n 9 | while IFS= read -r l; do
+      l="${l//'%'/'%25'}"
+      l="${l#"$PWD/"}"
+      echo "::error title=Firmware $name::$l"
+    done
     echo "::warning::El firmware no compila para $name"
   fi
   echo "::endgroup::"

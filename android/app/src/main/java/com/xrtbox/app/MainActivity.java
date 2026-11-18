@@ -313,21 +313,7 @@ public class MainActivity extends Activity implements EspLink.Listener {
         content.findViewById(R.id.btnTemplate).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                if (codeEdit.length() == 0) {
-                    codeEdit.setText(TEMPLATE);
-                    if (nameEdit.length() == 0) nameEdit.setText("Parpadeo");
-                    return;
-                }
-                dialog().setTitle("Plantilla")
-                        .setMessage("Se reemplazará el código actual por el ejemplo de parpadeo. ¿Continuar?")
-                        .setPositiveButton("REEMPLAZAR", new DialogInterface.OnClickListener() {
-                            @Override
-                            public void onClick(DialogInterface d, int w) {
-                                codeEdit.setText(TEMPLATE);
-                            }
-                        })
-                        .setNegativeButton("CANCELAR", null)
-                        .show();
+                showExamples();
             }
         });
         content.findViewById(R.id.btnClear).setOnClickListener(new View.OnClickListener() {
@@ -1143,6 +1129,76 @@ public class MainActivity extends Activity implements EspLink.Listener {
     // ------------------------------------------------------------------
     //  Utilidades
     // ------------------------------------------------------------------
+    // ---- ejemplos incluidos en la app (assets/ejemplos/*.cpp) ----
+    private void showExamples() {
+        final List<String> files = new ArrayList<>();
+        final List<String> titles = new ArrayList<>();
+        try {
+            String[] list = getAssets().list("ejemplos");
+            if (list != null) {
+                java.util.Arrays.sort(list);
+                for (String f : list) {
+                    if (!f.endsWith(".cpp")) continue;
+                    String code = readAsset("ejemplos/" + f);
+                    if (code == null) continue;
+                    String name = f.substring(0, f.length() - 4);
+                    String first = code.split("\n", 2)[0].trim();
+                    String title = first.startsWith("//") ? first.substring(2).trim() : name;
+                    files.add(f);
+                    titles.add(name.replace('_', ' ') + "\n" + title);
+                }
+            }
+        } catch (IOException e) {
+            // sin ejemplos: se usa la plantilla
+        }
+        if (files.isEmpty()) {
+            applyExample("Parpadeo", TEMPLATE);
+            return;
+        }
+        dialog().setTitle("Ejemplos")
+                .setItems(titles.toArray(new CharSequence[0]), new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        String f = files.get(which);
+                        String code = readAsset("ejemplos/" + f);
+                        if (code != null) applyExample(f.substring(0, f.length() - 4).replace('_', ' '), code);
+                    }
+                })
+                .setNegativeButton("CANCELAR", null)
+                .show();
+    }
+
+    private void applyExample(final String name, final String code) {
+        if (codeEdit.length() == 0) {
+            codeEdit.setText(code);
+            nameEdit.setText(name);
+            return;
+        }
+        dialog().setTitle("Ejemplo: " + name)
+                .setMessage("Se reemplazará el código actual por este ejemplo. ¿Continuar?")
+                .setPositiveButton("REEMPLAZAR", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        codeEdit.setText(code);
+                        nameEdit.setText(name);
+                    }
+                })
+                .setNegativeButton("CANCELAR", null)
+                .show();
+    }
+
+    private String readAsset(String path) {
+        try (InputStream in = getAssets().open(path)) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] b = new byte[4096];
+            int n;
+            while ((n = in.read(b)) > 0) out.write(b, 0, n);
+            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private AlertDialog.Builder dialog() {
         return new AlertDialog.Builder(this, R.style.DialogTheme);
     }

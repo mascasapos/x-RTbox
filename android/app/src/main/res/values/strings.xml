@@ -12,7 +12,7 @@
     <string name="hint_name">Nombre del programa</string>
     <string name="hint_code">// Pega aquí tu código C++ de Arduino\n// (setup, loop, pinMode, digitalWrite, delay...)</string>
     <string name="paste">PEGAR</string>
-    <string name="template">PLANTILLA</string>
+    <string name="template">EJEMPLOS</string>
     <string name="clear">BORRAR</string>
     <string name="save">GUARDAR</string>
     <string name="save_load">GUARDAR Y CARGAR</string>

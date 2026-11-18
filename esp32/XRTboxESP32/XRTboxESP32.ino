@@ -14,7 +14,7 @@
 //    la consola de la app.
 //
 //  Placas: ESP32, ESP32-S3, ESP32-C3, ESP32-C6 (cualquiera con BLE).
-//  Core: "esp32" de Espressif 3.3.x (recomendado) o 2.0.x en el Arduino IDE.
+//  Core: "esp32" de Espressif 3.x (recomendado 3.3.x) en el Arduino IDE.
 //        (La 4.0 cambio la API de Bluetooth y no es compatible.)
 //  Menu Herramientas -> Partition Scheme -> "Huge APP (3MB No OTA/1MB SPIFFS)"
 // =====================================================================
@@ -38,8 +38,18 @@
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
+#include "esp_idf_version.h"
+#include "esp32-hal-periman.h"
+#include <Wire.h>
+#include <SPI.h>
 #include "MiniC.h"
 
+// Las funciones de PWM, temporizadores, etc. son las del core 3.x.
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
+#error "X-RTbox necesita el core esp32 3.x. En Herramientas > Placa > Gestor de placas instala 'esp32' version 3.3.x."
+#endif
 // La version 4.0 del core reescribio la libreria Bluetooth con otra API.
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 4)
 #error "X-RTbox usa la API Bluetooth del core esp32 2.x/3.x. En Herramientas > Placa > Gestor de placas instala 'esp32' version 3.3.x."
@@ -229,14 +239,190 @@ static void sendState() {
 }
 
 // ---------------------------------------------------------------------
+//  Interrupciones, temporizadores y generadores de senal
+//  Las interrupciones reales solo anotan el evento; el interprete llama
+//  a la funcion del programa justo despues (entre dos instrucciones).
+// ---------------------------------------------------------------------
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#include "hal/dac_ll.h"
+#define XRT_HAS_DAC 1
+#else
+#define XRT_HAS_DAC 0
+#endif
+#if SOC_SDM_SUPPORTED
+#include "driver/sdm.h"
+#endif
+#if (SOC_I2C_NUM > 1) || (defined(SOC_HP_I2C_NUM) && (SOC_HP_I2C_NUM > 1))
+#define XRT_HAS_WIRE1 1
+#else
+#define XRT_HAS_WIRE1 0
+#endif
+#ifdef SOC_LEDC_SUPPORT_HS_MODE
+#define XRT_LEDC_CH (SOC_LEDC_CHANNEL_NUM * 2)
+#else
+#define XRT_LEDC_CH (SOC_LEDC_CHANNEL_NUM)
+#endif
+#define XRT_LEDC_BITS ((SOC_LEDC_TIMER_BIT_WIDTH) > 14 ? 14 : (SOC_LEDC_TIMER_BIT_WIDTH))
+
+static portMUX_TYPE evMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t evCount[32];
+static volatile uint32_t* evBits = nullptr;   // -> hal.eventBits
+static SemaphoreHandle_t evSem = nullptr;     // despierta al interprete si esta en delay()
+
+static void ARDUINO_ISR_ATTR postEvent(int slot) {
+  portENTER_CRITICAL_ISR(&evMux);
+  evCount[slot] = evCount[slot] + 1;
+  *evBits = *evBits | (1u << slot);
+  portEXIT_CRITICAL_ISR(&evMux);
+  if (evSem) {
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(evSem, &woken);
+    if (woken == pdTRUE) portYIELD_FROM_ISR();
+  }
+}
+
+// Interrupciones de pines (attachInterrupt) y contadores de pulsos
+struct PinIrq {
+  volatile uint32_t count;
+  volatile int8_t slot;   // evento del programa (-1 = solo cuenta)
+  bool active;
+  bool counter;
+};
+static PinIrq pinIrq[SOC_GPIO_PIN_COUNT];
+
+static void ARDUINO_ISR_ATTR pinIsr(void* arg) {
+  PinIrq* p = (PinIrq*)arg;
+  p->count = p->count + 1;
+  int s = p->slot;
+  if (s >= 0) postEvent(s);
+}
+
+// Temporizadores del programa (timerBegin...)
+static const int MAX_UTIMERS = 4;
+struct UserTimer {
+  hw_timer_t* t;
+  volatile int8_t slot;
+  volatile bool armed;
+  bool alarmOn;
+  bool reload;
+  uint64_t alarm;
+};
+static UserTimer utm[MAX_UTIMERS];
+
+static void ARDUINO_ISR_ATTR userTimerIsr(void* arg) {
+  UserTimer* u = (UserTimer*)arg;
+  int s = u->slot;
+  if (u->armed && s >= 0) postEvent(s);
+}
+
+// Generador de ondas (senoidal, triangular, diente de sierra) por DDS:
+// un temporizador saca 40000 muestras por segundo por el DAC (ESP32: pines
+// 25 y 26) o por el modulador sigma-delta en cualquier otro pin.
+static const uint32_t DDS_RATE = 40000;
+static const int DDS_MAX = 4;
+enum { DDS_OFF = 0, DDS_DAC = 1, DDS_SDM = 2 };
+struct DdsChan {
+  volatile uint8_t kind;
+  uint8_t dacCh;
+  int8_t pin;
+  void* sdm;
+  volatile uint32_t phase;
+  volatile uint32_t step;
+  uint8_t table[256];
+};
+static DdsChan dds[DDS_MAX];
+static hw_timer_t* ddsTimer = nullptr;
+
+static void ARDUINO_ISR_ATTR ddsIsr() {
+  for (int c = 0; c < DDS_MAX; c++) {
+    DdsChan& d = dds[c];
+    uint8_t k = d.kind;
+    if (k == DDS_OFF) continue;
+    uint32_t ph = d.phase + d.step;
+    d.phase = ph;
+    uint8_t v = d.table[ph >> 24];
+#if XRT_HAS_DAC
+    if (k == DDS_DAC) {
+      dac_ll_update_output_value((dac_channel_t)d.dacCh, v);
+      continue;
+    }
+#endif
+#if SOC_SDM_SUPPORTED
+    if (k == DDS_SDM) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+      sdm_channel_set_pulse_density((sdm_channel_handle_t)d.sdm, (int8_t)((int)v - 128));
+#else
+      sdm_channel_set_duty((sdm_channel_handle_t)d.sdm, (int8_t)((int)v - 128));
+#endif
+    }
+#endif
+  }
+}
+
+static int dacChannelOf(int pin) {
+#if CONFIG_IDF_TARGET_ESP32
+  if (pin == 25) return 0;
+  if (pin == 26) return 1;
+#elif CONFIG_IDF_TARGET_ESP32S2
+  if (pin == 17) return 0;
+  if (pin == 18) return 1;
+#endif
+  (void)pin;
+  return -1;
+}
+
+static ledc_channel_handle_t* ledcBus(int pin) {
+  if (pin < 0 || pin >= SOC_GPIO_PIN_COUNT) return nullptr;
+  return (ledc_channel_handle_t*)perimanGetPinBus((uint8_t)pin, ESP32_BUS_TYPE_LEDC);
+}
+
+static TwoWire* wireBus(int b) {
+#if XRT_HAS_WIRE1
+  if (b == 1) return &Wire1;
+#endif
+  return b == 0 ? &Wire : nullptr;
+}
+
+// ---------------------------------------------------------------------
 //  Hardware para el interprete
 // ---------------------------------------------------------------------
 class EspHal : public minic::Hal {
  public:
-  uint64_t outPins = 0, pwmPins = 0, tonePins = 0;
+  uint64_t outPins = 0, pwmPins = 0, tonePins = 0, rgbPins = 0;
   bool rgbUsed = false;
   uint32_t lastYield = 0;
   char perr[80];
+  char nerr[160];
+
+  // estado de las librerias
+  struct ChCfg { uint32_t freq; uint8_t res; bool setup; uint64_t pins; int64_t duty; };
+  ChCfg chCfg[XRT_LEDC_CH];
+  bool chMode = false;                 // el programa usa la API 2.x (ledcSetup/canales)
+  uint32_t awFreq = 1000;
+  uint8_t awRes = 8;
+  uint32_t pinAwFreq[64];
+  uint8_t pinAwRes[64];
+  struct ServoCh { int8_t pin; uint16_t minUs, maxUs, us; };
+  ServoCh servos[16];
+  uint32_t slotUsed = 0;
+  bool wireUsed[2] = {false, false};
+  bool spiUsed = false;
+  uint32_t bootCpuMhz = 0;
+
+  EspHal() {
+    evBits = &eventBits;
+    clearTables();
+  }
+
+  void clearTables() {
+    for (int c = 0; c < XRT_LEDC_CH; c++) { chCfg[c] = ChCfg{0, 0, false, 0, -1}; }
+    chMode = false;
+    awFreq = 1000;
+    awRes = 8;
+    memset(pinAwFreq, 0, sizeof pinAwFreq);
+    memset(pinAwRes, 0, sizeof pinAwRes);
+    for (int s = 0; s < 16; s++) servos[s] = ServoCh{-1, 544, 2400, 1500};
+  }
 
   static bool isRgb(int pin) {
 #ifdef RGB_BUILTIN
@@ -286,16 +472,32 @@ class EspHal : public minic::Hal {
   int digitalRead(int pin) override { return ::digitalRead(pin); }
   int analogRead(int pin) override { return ::analogRead(pin); }
   void analogWrite(int pin, int v) override {
-    if (pin >= 0 && pin < 64) { pwmPins |= (1ULL << pin); outPins |= (1ULL << pin); }
-    ::analogWrite(pin, v < 0 ? 0 : v);
+    if (v < 0) v = 0;
+    if (pin < 0 || pin >= SOC_GPIO_PIN_COUNT || pin >= 64) { ::analogWrite(pin, v); return; }
+    pwmPins |= (1ULL << pin);
+    outPins |= (1ULL << pin);
+    ledc_channel_handle_t* b = ledcBus(pin);
+    uint8_t res;
+    if (b) {
+      res = b->channel_resolution;
+    } else {
+      res = pinAwRes[pin] ? pinAwRes[pin] : awRes;
+      ::analogWriteResolution(pin, res);   // pin sin PWM: fija la resolucion y la frecuencia del siguiente
+      ::analogWriteFrequency(pin, pinAwFreq[pin] ? pinAwFreq[pin] : awFreq);
+    }
+    int maxv = (1 << res) - 1;
+    if (v > maxv) v = maxv;
+    ::analogWrite(pin, v);
   }
   void analogReadResolution(int bits) override { ::analogReadResolution(bits); }
   void dacWrite(int pin, int v) override {
-#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#if XRT_HAS_DAC
+    stopDds(pin);
+    markOut(pin);
     ::dacWrite(pin, (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)));
 #else
     (void)pin; (void)v;
-    write("[X-RTbox] dacWrite no existe en este ESP32\r\n", 44);
+    write("[X-RTbox] dacWrite no existe en este ESP32 (no tiene DAC)\r\n", 58);
 #endif
   }
   int touchRead(int pin) override {
@@ -316,7 +518,14 @@ class EspHal : public minic::Hal {
   }
   uint32_t millis() override { return ::millis(); }
   uint32_t micros() override { return ::micros(); }
-  void delayMs(uint32_t ms) override { ::delay(ms); lastYield = ::millis(); }
+  void delayMs(uint32_t ms) override {
+    // espera, pero se despierta en cuanto llega una interrupcion
+    if (!eventBits && ms) {
+      if (evSem) xSemaphoreTake(evSem, pdMS_TO_TICKS(ms));
+      else ::delay(ms);
+    }
+    lastYield = ::millis();
+  }
   void delayUs(uint32_t us) override { ::delayMicroseconds(us); }
   void write(const char* s, size_t n) override {
     if (Serial) Serial.write((const uint8_t*)s, n);
@@ -347,20 +556,796 @@ class EspHal : public minic::Hal {
 #endif
   }
 
+  int pinConstant(const std::string& n) override {
+    if (n == "SDA") return SDA;
+    if (n == "SCL") return SCL;
+    if (n == "MOSI") return MOSI;
+    if (n == "MISO") return MISO;
+    if (n == "SCK") return SCK;
+    if (n == "SS") return SS;
+    if (n == "TX") return TX;
+    if (n == "RX") return RX;
+#if CONFIG_IDF_TARGET_ESP32
+    if (n == "DAC1") return 25;
+    if (n == "DAC2") return 26;
+#elif CONFIG_IDF_TARGET_ESP32S2
+    if (n == "DAC1") return 17;
+    if (n == "DAC2") return 18;
+#endif
+    if (n.size() >= 2 && n.size() <= 3 && n[0] == 'A' && isdigit((unsigned char)n[1]) &&
+        (n.size() == 2 || isdigit((unsigned char)n[2]))) {
+      int ch = atoi(n.c_str() + 1);
+      int p = analogChannelToDigitalPin((uint8_t)ch);
+      if (p >= 0) return p;
+    }
+    return -1;
+  }
+
+  // ---- eventos (interrupciones) ----
+  uint32_t takeEvents() override {
+    portENTER_CRITICAL(&evMux);
+    uint32_t b = eventBits;
+    eventBits = 0;
+    portEXIT_CRITICAL(&evMux);
+    return b;
+  }
+  uint32_t takeEventCount(int s) override {
+    if (s < 0 || s >= 32) return 0;
+    portENTER_CRITICAL(&evMux);
+    uint32_t c = evCount[s];
+    evCount[s] = 0;
+    portEXIT_CRITICAL(&evMux);
+    return c;
+  }
+  int allocSlot() {
+    for (int s = 0; s < 32; s++) {
+      if (slotUsed & (1u << s)) continue;
+      slotUsed |= 1u << s;
+      portENTER_CRITICAL(&evMux);
+      evCount[s] = 0;
+      eventBits = eventBits & ~(1u << s);
+      portEXIT_CRITICAL(&evMux);
+      return s;
+    }
+    return -1;
+  }
+  void freeSlot(int s) {
+    if (s < 0 || s >= 32) return;
+    slotUsed &= ~(1u << s);
+    portENTER_CRITICAL(&evMux);
+    evCount[s] = 0;
+    eventBits = eventBits & ~(1u << s);
+    portEXIT_CRITICAL(&evMux);
+  }
+
+  std::string nativeStr(int fn) override {
+    if (fn == minic::NS_CHIP_MODEL) return std::string(ESP.getChipModel());
+    if (fn == minic::NS_SDK_VERSION) return std::string(ESP.getSdkVersion());
+    return std::string();
+  }
+
+  double nfail(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(nerr, sizeof nerr, fmt, ap);
+    va_end(ap);
+    nativeError = nerr;
+    return 0;
+  }
+  bool pinOk(int pin, bool out) {
+    const char* e = pinError(pin, out);
+    if (e) { nativeError = e; return false; }
+    if (pin < 0 || pin >= SOC_GPIO_PIN_COUNT) { nativeError = "este pin no sirve para esto"; return false; }
+    return true;
+  }
+  void unlinkChannels(int pin) {
+    for (int c = 0; c < XRT_LEDC_CH; c++) chCfg[c].pins &= ~(1ULL << pin);
+  }
+  void releaseLedc(int pin) {
+    if (ledcBus(pin)) ::ledcDetach((uint8_t)pin);
+    unlinkChannels(pin);
+  }
+  bool badRes(uint32_t freq, int res) {
+    if (freq < 1) { nfail("la frecuencia debe ser mayor que 0"); return true; }
+    if (res < 1 || res > SOC_LEDC_TIMER_BIT_WIDTH) { nfail("la resolucion debe estar entre 1 y %d bits", SOC_LEDC_TIMER_BIT_WIDTH); return true; }
+    if ((double)freq * (double)(1UL << res) > 80000000.0) {
+      nfail("con %d bits la frecuencia maxima es %lu Hz (baja la resolucion)", res, (unsigned long)(80000000UL >> res));
+      return true;
+    }
+    return false;
+  }
+  // En la API 2.x el primer argumento es un canal; en la 3.x es un pin.
+  int ledcTarget(int x) {
+    if (chMode && x >= 0 && x < XRT_LEDC_CH && chCfg[x].setup) {
+      if (!chCfg[x].pins) return -2;
+      return __builtin_ctzll(chCfg[x].pins);
+    }
+    return x;
+  }
+  int ledcTargetOrFail(int x) {
+    int p = ledcTarget(x);
+    if (p == -2) { nfail("el canal %d no tiene ningun pin: usa ledcAttachPin(pin, %d)", x, x); return -1; }
+    return p;
+  }
+
+  // ---- generadores ----
+  int ddsFind(int pin) {
+    for (int c = 0; c < DDS_MAX; c++)
+      if (dds[c].kind != DDS_OFF && dds[c].pin == pin) return c;
+    return -1;
+  }
+  void stopDds(int pin) {
+    int c = ddsFind(pin);
+    if (c < 0) return;
+    dds[c].kind = DDS_OFF;
+    dds[c].pin = -1;
+    ::pinMode(pin, OUTPUT);     // libera el DAC / sigma-delta del pin
+    ::digitalWrite(pin, LOW);
+    bool any = false;
+    for (int k = 0; k < DDS_MAX; k++) any = any || dds[k].kind != DDS_OFF;
+    if (!any && ddsTimer) {
+      ::timerEnd(ddsTimer);
+      ddsTimer = nullptr;
+    }
+  }
+  double startWave(int fn, const double* a, int n) {
+    int pin = (int)a[0];
+    double f = a[1];
+    double amp = n > 2 ? a[2] : 1.65;
+    double off = n > 3 ? a[3] : 1.65;
+    if (!(f > 0) || f > DDS_RATE / 4) return nfail("la frecuencia debe estar entre 0 y %lu Hz (para mas usa signalSquare)", (unsigned long)(DDS_RATE / 4));
+    if (amp < 0) return nfail("la amplitud no puede ser negativa");
+    uint8_t tab[256];
+    for (int i = 0; i < 256; i++) {
+      double w;
+      if (fn == minic::NF_SIG_SINE) w = sin(2.0 * M_PI * i / 256.0);
+      else if (fn == minic::NF_SIG_TRIANGLE) w = i < 128 ? -1.0 + i / 64.0 : 3.0 - i / 64.0;
+      else w = -1.0 + i / 127.5;
+      double v = (off + amp * w) * 255.0 / 3.3;
+      tab[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : lround(v)));
+    }
+    int c = ddsFind(pin);
+    if (c < 0) {
+      for (int k = 0; k < DDS_MAX && c < 0; k++)
+        if (dds[k].kind == DDS_OFF) c = k;
+      if (c < 0) return nfail("como maximo %d senales a la vez", DDS_MAX);
+    }
+    uint8_t kind = dds[c].kind;
+    dds[c].kind = DDS_OFF;
+    if (kind == DDS_OFF) {
+      releaseLedc(pin);
+      int dch = dacChannelOf(pin);
+      if (dch >= 0) {
+#if XRT_HAS_DAC
+        if (!::dacWrite((uint8_t)pin, tab[0])) return nfail("no se pudo activar el DAC del pin %d", pin);
+        dds[c].dacCh = (uint8_t)dch;
+        kind = DDS_DAC;
+#endif
+      } else {
+#if SOC_SDM_SUPPORTED
+        bool ok = ::sigmaDeltaAttach((uint8_t)pin, 10000000) || ::sigmaDeltaAttach((uint8_t)pin, 1000000) ||
+                  ::sigmaDeltaAttach((uint8_t)pin, 312500);
+        void* h = ok ? perimanGetPinBus((uint8_t)pin, ESP32_BUS_TYPE_SIGMADELTA) : nullptr;
+        if (!h) return nfail("no se pudo usar el modulador sigma-delta en el pin %d (no quedan canales)", pin);
+        dds[c].sdm = h;
+        kind = DDS_SDM;
+#else
+        return nfail("el pin %d no puede sacar esta senal en este ESP32", pin);
+#endif
+      }
+    }
+    memcpy(dds[c].table, tab, sizeof tab);
+    uint32_t step = (uint32_t)llround(f * 4294967296.0 / (double)DDS_RATE);
+    dds[c].step = step;
+    dds[c].pin = (int8_t)pin;
+    markOut(pin);
+    if (!ddsTimer) {
+      ddsTimer = ::timerBegin(1000000);
+      if (!ddsTimer) {
+        ::pinMode(pin, OUTPUT);
+        return nfail("no queda ningun temporizador libre para el generador");
+      }
+      ::timerAttachInterrupt(ddsTimer, ddsIsr);
+      ::timerAlarm(ddsTimer, 1000000 / DDS_RATE, true, 0);
+    }
+    dds[c].kind = kind;
+    return (double)step * (double)DDS_RATE / 4294967296.0;
+  }
+  double startSquare(const double* a, int n) {
+    int pin = (int)a[0];
+    double f = a[1];
+    double duty = n > 2 ? a[2] : 50.0;
+    if (!(f >= 1) || f > 40000000.0) return nfail("la frecuencia debe estar entre 1 Hz y 40 MHz");
+    if (duty < 0 || duty > 100) return nfail("el ciclo de trabajo va de 0 a 100 (%%)");
+    stopDds(pin);
+    releaseLedc(pin);
+    uint32_t fi = (uint32_t)lround(f);
+    int res = XRT_LEDC_BITS;
+    while (res > 1 && (double)fi * (double)(1UL << res) > 80000000.0) res--;
+    bool ok = false;
+    for (; res >= 1 && !ok; ) {
+      ok = ::ledcAttach((uint8_t)pin, fi, (uint8_t)res);
+      if (!ok) res--;
+    }
+    if (!ok) return nfail("no se pudo generar %lu Hz en el pin %d (no quedan temporizadores PWM libres)", (unsigned long)fi, pin);
+    markOut(pin);
+    uint32_t full = 1UL << res;
+    uint32_t d = (uint32_t)lround(duty / 100.0 * full);
+    if (d >= full) d = full;
+    ::ledcWrite((uint8_t)pin, d);
+    return (double)::ledcReadFreq((uint8_t)pin);
+  }
+
+  UserTimer* timerOf(double h) {
+    int i = (int)h - 1;
+    if (i < 0 || i >= MAX_UTIMERS || !utm[i].t) { nfail("temporizador no valido: usa el valor que devuelve timerBegin()"); return nullptr; }
+    return &utm[i];
+  }
+  ServoCh* servoOf(double h) {
+    int i = (int)h - 1;
+    if (i < 0 || i >= 16 || servos[i].pin < 0) { nfail("el servo no esta conectado: usa primero .attach(pin)"); return nullptr; }
+    return &servos[i];
+  }
+  void servoWriteUs(ServoCh& s, double us) {
+    if (us < s.minUs) us = s.minUs;
+    if (us > s.maxUs) us = s.maxUs;
+    s.us = (uint16_t)lround(us);
+    uint32_t duty = (uint32_t)lround(us * (double)(1UL << XRT_LEDC_BITS) / 20000.0);
+    ::ledcWrite((uint8_t)s.pin, duty);
+  }
+
+  double native(int fn, const double* a, int n) override {
+    using namespace minic;
+    switch (fn) {
+      // ---------------- PWM (LEDC) ----------------
+      case NF_LEDC_ATTACH: case NF_LEDC_ATTACH_CH: {
+        int pin = (int)a[0];
+        uint32_t f = (uint32_t)lround(a[1]);
+        int res = (int)a[2];
+        if (badRes(f, res)) return 0;
+        stopDds(pin);
+        releaseLedc(pin);
+        markOut(pin);
+        bool ok;
+        if (fn == NF_LEDC_ATTACH_CH) {
+          int ch = (int)a[3];
+          if (ch < 0 || ch >= XRT_LEDC_CH) return nfail("el canal debe estar entre 0 y %d", XRT_LEDC_CH - 1);
+          ok = ::ledcAttachChannel((uint8_t)pin, f, (uint8_t)res, (uint8_t)ch);
+        } else {
+          ok = ::ledcAttach((uint8_t)pin, f, (uint8_t)res);
+        }
+        if (!ok) return nfail("no se pudo poner %lu Hz con %d bits en el pin %d (no quedan temporizadores PWM: usa la misma frecuencia y resolucion que otro pin)", (unsigned long)f, res, pin);
+        return 1;
+      }
+      case NF_LEDC_SETUP: {
+        int ch = (int)a[0];
+        uint32_t f = (uint32_t)lround(a[1]);
+        int res = (int)a[2];
+        if (ch < 0 || ch >= XRT_LEDC_CH) return nfail("el canal debe estar entre 0 y %d", XRT_LEDC_CH - 1);
+        if (badRes(f, res)) return 0;
+        chMode = true;
+        chCfg[ch].freq = f;
+        chCfg[ch].res = (uint8_t)res;
+        chCfg[ch].setup = true;
+        if (chCfg[ch].pins) ::ledcChangeFrequency((uint8_t)__builtin_ctzll(chCfg[ch].pins), f, (uint8_t)res);
+        return f;
+      }
+      case NF_LEDC_ATTACH_PIN: {
+        int pin = (int)a[0], ch = (int)a[1];
+        if (ch < 0 || ch >= XRT_LEDC_CH || !chCfg[ch].setup) return nfail("usa antes ledcSetup(%d, frecuencia, bits)", ch);
+        stopDds(pin);
+        releaseLedc(pin);
+        markOut(pin);
+        if (!::ledcAttachChannel((uint8_t)pin, chCfg[ch].freq, chCfg[ch].res, (uint8_t)ch))
+          return nfail("no se pudo conectar el pin %d al canal %d", pin, ch);
+        chCfg[ch].pins |= 1ULL << pin;
+        if (chCfg[ch].duty >= 0) ::ledcWrite((uint8_t)pin, (uint32_t)chCfg[ch].duty);
+        return 0;
+      }
+      case NF_LEDC_DETACH: {
+        int pin = (int)a[0];
+        bool had = ledcBus(pin) != nullptr;
+        releaseLedc(pin);
+        return had;
+      }
+      case NF_LEDC_WRITE: {
+        int x = (int)a[0];
+        uint32_t duty = a[1] < 0 ? 0 : (uint32_t)a[1];
+        if (chMode && x >= 0 && x < XRT_LEDC_CH && chCfg[x].setup) {
+          chCfg[x].duty = duty;
+          if (!chCfg[x].pins) return 1;   // se aplicara al conectar el pin
+          return ::ledcWrite((uint8_t)__builtin_ctzll(chCfg[x].pins), duty);
+        }
+        if (!ledcBus(x)) {
+          if (!pinOk(x, true)) return 0;
+          return nfail("el pin %d no tiene PWM: usa antes ledcAttach(%d, frecuencia, bits)", x, x);
+        }
+        return ::ledcWrite((uint8_t)x, duty);
+      }
+      case NF_LEDC_TONE: case NF_LEDC_NOTE: {
+        int p = ledcTargetOrFail((int)a[0]);
+        if (p < 0) return 0;
+        uint32_t f = 0;
+        if (fn == NF_LEDC_TONE) {
+          f = a[1] < 0 ? 0 : (uint32_t)lround(a[1]);
+        } else {
+          int note = (int)a[1], oct = (int)a[2];
+          if (note < 0 || note > 11 || oct < 0 || oct > 8) return nfail("nota 0..11 (NOTE_C..NOTE_B) y octava 0..8");
+          static const uint16_t base[12] = {4186, 4435, 4699, 4978, 5274, 5588, 5920, 6272, 6645, 7040, 7459, 7902};
+          f = base[note] >> (8 - oct);
+        }
+        if (!ledcBus(p)) {
+          if (!pinOk(p, true)) return 0;
+          if (f == 0) return 0;
+          stopDds(p);
+          markOut(p);
+          if (!::ledcAttach((uint8_t)p, f, 10)) return nfail("no se pudo sacar el tono por el pin %d", p);
+        }
+        if (fn == NF_LEDC_TONE) return ::ledcWriteTone((uint8_t)p, f);
+        return ::ledcWriteNote((uint8_t)p, (note_t)(int)a[1], (uint8_t)a[2]);
+      }
+      case NF_LEDC_READ: case NF_LEDC_READ_FREQ: {
+        int p = ledcTarget((int)a[0]);
+        if (p < 0 || !ledcBus(p)) return 0;
+        return fn == NF_LEDC_READ ? ::ledcRead((uint8_t)p) : ::ledcReadFreq((uint8_t)p);
+      }
+      case NF_LEDC_CHANGE_FREQ: {
+        int x = (int)a[0];
+        int p = ledcTargetOrFail(x);
+        if (p < 0) return 0;
+        uint32_t f = (uint32_t)lround(a[1]);
+        int res = (int)a[2];
+        if (badRes(f, res)) return 0;
+        if (!ledcBus(p)) return nfail("el pin %d no tiene PWM: usa antes ledcAttach()", p);
+        uint32_t got = ::ledcChangeFrequency((uint8_t)p, f, (uint8_t)res);
+        if (!got) return nfail("no se pudo cambiar a %lu Hz con %d bits", (unsigned long)f, res);
+        if (chMode && x >= 0 && x < XRT_LEDC_CH && chCfg[x].setup) { chCfg[x].freq = f; chCfg[x].res = (uint8_t)res; }
+        return got;
+      }
+      case NF_LEDC_FADE: {
+        int pin = (int)a[0];
+        if (!ledcBus(pin)) return nfail("el pin %d no tiene PWM: usa antes ledcAttach()", pin);
+        return ::ledcFade((uint8_t)pin, (uint32_t)a[1], (uint32_t)a[2], (int)a[3]);
+      }
+      case NF_AW_FREQ: case NF_AW_RES: {
+        bool perPin = n == 2;
+        int pin = perPin ? (int)a[0] : -1;
+        double v = perPin ? a[1] : a[0];
+        if (perPin && (!pinOk(pin, true) || pin >= 64)) return 0;
+        if (fn == NF_AW_FREQ) {
+          if (!(v >= 1)) return nfail("la frecuencia debe ser mayor que 0");
+          if (perPin) pinAwFreq[pin] = (uint32_t)lround(v);
+          else awFreq = (uint32_t)lround(v);
+        } else {
+          if (v < 1 || v > SOC_LEDC_TIMER_BIT_WIDTH) return nfail("la resolucion debe estar entre 1 y %d bits", SOC_LEDC_TIMER_BIT_WIDTH);
+          if (perPin) pinAwRes[pin] = (uint8_t)v;
+          else awRes = (uint8_t)v;
+        }
+        // aplica el cambio a los pines que ya estan sacando analogWrite
+        for (int p = 0; p < SOC_GPIO_PIN_COUNT && p < 64; p++) {
+          if (perPin ? p != pin : (!(pwmPins & (1ULL << p)))) continue;
+          ledc_channel_handle_t* b = ledcBus(p);
+          if (!b) continue;
+          uint32_t f = fn == NF_AW_FREQ ? (uint32_t)lround(v) : b->freq_hz;
+          uint8_t r = fn == NF_AW_RES ? (uint8_t)v : b->channel_resolution;
+          if (!perPin && ((fn == NF_AW_FREQ && pinAwFreq[p]) || (fn == NF_AW_RES && pinAwRes[p]))) continue;
+          if (!::ledcChangeFrequency((uint8_t)p, f, r)) return nfail("no se puede poner %lu Hz con %d bits", (unsigned long)f, r);
+        }
+        return 0;
+      }
+
+      // ---------------- generadores de senal ----------------
+      case NF_SIG_SINE: case NF_SIG_TRIANGLE: case NF_SIG_SAW:
+        return startWave(fn, a, n);
+      case NF_SIG_SQUARE:
+        return startSquare(a, n);
+      case NF_SIG_STOP: {
+        int pin = (int)a[0];
+        if (ddsFind(pin) >= 0) { stopDds(pin); return 0; }
+        if (ledcBus(pin)) {
+          releaseLedc(pin);
+          ::pinMode(pin, OUTPUT);
+          ::digitalWrite(pin, LOW);
+        }
+        return 0;
+      }
+      case NF_DAC_DISABLE: {
+        int pin = (int)a[0];
+#if XRT_HAS_DAC
+        if (ddsFind(pin) >= 0) stopDds(pin);
+        ::dacDisable((uint8_t)pin);
+        return 0;
+#else
+        (void)pin;
+        return nfail("este ESP32 no tiene DAC");
+#endif
+      }
+
+      // ---------------- contadores y medida ----------------
+      case NF_CNT_START: {
+        int pin = (int)a[0];
+        int mode = n > 1 ? (int)a[1] : RISING;
+        if (mode < 1 || mode > 3) return nfail("el modo debe ser RISING, FALLING o CHANGE");
+        PinIrq& q = pinIrq[pin];
+        if (q.active) { q.counter = true; return 0; }
+        q.count = 0;
+        q.slot = -1;
+        q.counter = true;
+        q.active = true;
+        ::attachInterruptArg((uint8_t)pin, pinIsr, &q, mode);
+        return 1;
+      }
+      case NF_CNT_READ: {
+        int pin = (int)a[0];
+        return pinIrq[pin].active ? (double)pinIrq[pin].count : 0.0;
+      }
+      case NF_CNT_RESET:
+        pinIrq[(int)a[0]].count = 0;
+        return 0;
+      case NF_CNT_STOP: {
+        int pin = (int)a[0];
+        PinIrq& q = pinIrq[pin];
+        q.counter = false;
+        if (q.active && q.slot < 0) {
+          ::detachInterrupt((uint8_t)pin);
+          q.active = false;
+        }
+        return 0;
+      }
+      case NF_PULSEIN_LONG: {
+        unsigned long to = n > 2 ? (unsigned long)a[2] : 1000000UL;
+        return (double)::pulseInLong((uint8_t)a[0], a[1] != 0 ? HIGH : LOW, to);
+      }
+      case NF_PIN_EVENT_ATTACH: {
+        int pin = (int)a[0];
+        int mode = (int)a[1];
+        if (!((mode >= 1 && mode <= 5) || mode == 0x0C || mode == 0x0D))
+          return nfail("el modo debe ser RISING, FALLING, CHANGE, ONLOW u ONHIGH");
+        PinIrq& q = pinIrq[pin];
+        int s = q.slot;
+        if (s < 0) {
+          s = allocSlot();
+          if (s < 0) return nfail("demasiadas interrupciones a la vez (maximo 32)");
+        }
+        if (!q.active) q.count = 0;
+        q.slot = (int8_t)s;
+        q.active = true;
+        ::attachInterruptArg((uint8_t)pin, pinIsr, &q, mode);
+        return s;
+      }
+      case NF_PIN_EVENT_DETACH: {
+        int pin = (int)a[0];
+        if (pin < 0 || pin >= SOC_GPIO_PIN_COUNT) return -1;
+        PinIrq& q = pinIrq[pin];
+        int s = q.slot;
+        if (!q.active || s < 0) return -1;
+        q.slot = -1;
+        freeSlot(s);
+        if (!q.counter) {
+          ::detachInterrupt((uint8_t)pin);
+          q.active = false;
+        }
+        return s;
+      }
+
+      // ---------------- temporizadores ----------------
+      case NF_TIMER_BEGIN: {
+        double f = a[0];
+        if (!(f >= 1) || f > 80000000.0) return nfail("frecuencia no valida (lo normal es timerBegin(1000000) = 1 MHz)");
+        int i = -1;
+        for (int k = 0; k < MAX_UTIMERS && i < 0; k++)
+          if (!utm[k].t) i = k;
+        if (i < 0) return nfail("como maximo %d temporizadores a la vez", MAX_UTIMERS);
+        hw_timer_t* t = ::timerBegin((uint32_t)lround(f));
+        if (!t) return nfail("no se pudo crear el temporizador a %.0f Hz (usa entre 1250 Hz y 40 MHz, o no quedan libres)", f);
+        utm[i].t = t;
+        utm[i].slot = -1;
+        utm[i].armed = true;
+        utm[i].alarmOn = false;
+        utm[i].reload = true;
+        utm[i].alarm = 0;
+        return i + 1;
+      }
+      case NF_TIMER_ATTACH: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        int s = u->slot;
+        if (s < 0) {
+          s = allocSlot();
+          if (s < 0) return nfail("demasiadas interrupciones a la vez (maximo 32)");
+        }
+        u->slot = (int8_t)s;
+        ::timerAttachInterruptArg(u->t, userTimerIsr, u);
+        return s;
+      }
+      case NF_TIMER_DETACH: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return -1;
+        ::timerDetachInterrupt(u->t);
+        int s = u->slot;
+        u->slot = -1;
+        freeSlot(s);
+        return s;
+      }
+      case NF_TIMER_ALARM: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        u->alarm = (uint64_t)a[1];
+        u->reload = n > 2 ? a[2] != 0 : true;
+        u->armed = true;
+        u->alarmOn = true;
+        ::timerAlarm(u->t, u->alarm, u->reload, n > 3 ? (uint64_t)a[3] : 0);
+        return 0;
+      }
+      case NF_TIMER_ALARM_WRITE: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        u->alarm = (uint64_t)a[1];
+        u->reload = n > 2 ? a[2] != 0 : true;
+        if (u->alarmOn) ::timerAlarm(u->t, u->alarm, u->reload, 0);
+        return 0;
+      }
+      case NF_TIMER_ALARM_ENABLE: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        if (!u->alarm) return nfail("usa antes timerAlarmWrite(timer, valor, true)");
+        u->armed = true;
+        u->alarmOn = true;
+        ::timerAlarm(u->t, u->alarm, u->reload, 0);
+        return 0;
+      }
+      case NF_TIMER_ALARM_DISABLE: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        u->armed = false;
+        u->alarmOn = false;
+        return 0;
+      }
+      case NF_TIMER_START: case NF_TIMER_STOP: case NF_TIMER_RESTART: case NF_TIMER_END:
+      case NF_TIMER_READ: case NF_TIMER_READ_US: case NF_TIMER_READ_MS: case NF_TIMER_READ_S:
+      case NF_TIMER_WRITE: {
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        switch (fn) {
+          case NF_TIMER_START: ::timerStart(u->t); return 0;
+          case NF_TIMER_STOP: ::timerStop(u->t); return 0;
+          case NF_TIMER_RESTART: ::timerRestart(u->t); return 0;
+          case NF_TIMER_READ: return (double)::timerRead(u->t);
+          case NF_TIMER_READ_US: return (double)::timerReadMicros(u->t);
+          case NF_TIMER_READ_MS: return (double)::timerReadMillis(u->t);
+          case NF_TIMER_READ_S: return ::timerReadSeconds(u->t);
+          case NF_TIMER_WRITE: ::timerWrite(u->t, (uint64_t)a[1]); return 0;
+          default: break;
+        }
+        endTimer(*u);   // NF_TIMER_END
+        return 0;
+      }
+
+      // ---------------- I2C ----------------
+      case NF_WIRE_BEGIN: case NF_WIRE_END: case NF_WIRE_CLOCK: case NF_WIRE_GETCLOCK: case NF_WIRE_BEGINTX:
+      case NF_WIRE_WRITE: case NF_WIRE_ENDTX: case NF_WIRE_REQUEST: case NF_WIRE_AVAILABLE: case NF_WIRE_READ:
+      case NF_WIRE_PEEK: {
+        int b = (int)a[0];
+        TwoWire* w = wireBus(b);
+        if (!w) return nfail("este ESP32 solo tiene un bus I2C: usa Wire");
+        switch (fn) {
+          case NF_WIRE_BEGIN: {
+            int argc = n - 1;
+            bool ok;
+            if (argc == 0) ok = w->begin();
+            else if (argc == 1) return nfail("el modo esclavo (Wire.begin(direccion)) no esta soportado: usa Wire.begin() o Wire.begin(SDA, SCL)");
+            else {
+              if (!pinOk((int)a[1], true) || !pinOk((int)a[2], true)) return 0;
+              ok = w->begin((int)a[1], (int)a[2], argc > 2 ? (uint32_t)a[3] : 0);
+            }
+            wireUsed[b] = true;
+            if (!ok) return nfail("no se pudo iniciar el bus I2C (revisa los pines SDA y SCL)");
+            return 1;
+          }
+          case NF_WIRE_END: wireUsed[b] = false; return w->end();
+          case NF_WIRE_CLOCK: w->setClock((uint32_t)a[1]); return 0;
+          case NF_WIRE_GETCLOCK: return w->getClock();
+          case NF_WIRE_BEGINTX: w->beginTransmission((uint8_t)a[1]); return 0;
+          case NF_WIRE_WRITE: return (double)w->write((uint8_t)((int)a[1] & 0xFF));
+          case NF_WIRE_ENDTX: return n > 1 ? w->endTransmission(a[1] != 0) : w->endTransmission();
+          case NF_WIRE_REQUEST:
+            return (double)w->requestFrom((uint8_t)a[1], (size_t)a[2], n > 3 ? a[3] != 0 : true);
+          case NF_WIRE_AVAILABLE: return w->available();
+          case NF_WIRE_READ: return w->read();
+          default: return w->peek();
+        }
+      }
+
+      // ---------------- SPI ----------------
+      case NF_SPI_BEGIN: {
+        int8_t p[4] = {-1, -1, -1, -1};
+        for (int k = 0; k < n && k < 4; k++) {
+          p[k] = (int8_t)a[k];
+          if (p[k] >= 0 && !pinOk(p[k], k != 1)) return 0;
+        }
+        SPI.begin(p[0], p[1], p[2], p[3]);
+        spiUsed = true;
+        return 0;
+      }
+      case NF_SPI_END: SPI.end(); spiUsed = false; return 0;
+      case NF_SPI_BEGINTX: {
+        int64_t v = (int64_t)a[0];
+        uint32_t clk = (uint32_t)(v & 0xFFFFFFFFLL);
+        uint8_t order = (uint8_t)((v >> 32) & 0xFF);
+        uint8_t mode = (uint8_t)((v >> 40) & 0xFF);
+        if (clk == 0) clk = 1000000;
+        SPI.beginTransaction(SPISettings(clk, order ? SPI_MSBFIRST : SPI_LSBFIRST, mode));
+        return 0;
+      }
+      case NF_SPI_ENDTX: SPI.endTransaction(); return 0;
+      case NF_SPI_TRANSFER: return SPI.transfer((uint8_t)((int)a[0] & 0xFF));
+      case NF_SPI_TRANSFER16: return SPI.transfer16((uint16_t)((int64_t)a[0] & 0xFFFF));
+      case NF_SPI_TRANSFER32: return (double)SPI.transfer32((uint32_t)((int64_t)a[0] & 0xFFFFFFFFLL));
+      case NF_SPI_FREQ: SPI.setFrequency((uint32_t)a[0]); return 0;
+      case NF_SPI_MODE: SPI.setDataMode((uint8_t)a[0]); return 0;
+      case NF_SPI_ORDER: SPI.setBitOrder((uint8_t)a[0] ? SPI_MSBFIRST : SPI_LSBFIRST); return 0;
+      case NF_SPI_WRITE: SPI.write((uint8_t)((int)a[0] & 0xFF)); return 0;
+      case NF_SPI_WRITE16: SPI.write16((uint16_t)((int64_t)a[0] & 0xFFFF)); return 0;
+      case NF_SPI_WRITE32: SPI.write32((uint32_t)((int64_t)a[0] & 0xFFFFFFFFLL)); return 0;
+
+      // ---------------- Servo (PWM a 50 Hz) ----------------
+      case NF_SERVO_ATTACH: {
+        int h = (int)a[0];
+        int pin = (int)a[1];
+        int mn = n > 2 ? (int)a[2] : 544, mx = n > 3 ? (int)a[3] : 2400;
+        if (mn < 100 || mx > 3000 || mn >= mx) return nfail("los limites del servo deben ir de 100 a 3000 us (min < max)");
+        int i = (h >= 1 && h <= 16) ? h - 1 : -1;
+        if (i >= 0 && servos[i].pin >= 0 && servos[i].pin != pin) releaseLedc(servos[i].pin);
+        if (i < 0) {
+          for (int k = 0; k < 16 && i < 0; k++)
+            if (servos[k].pin < 0) i = k;
+          if (i < 0) return nfail("como maximo 16 servos");
+        }
+        stopDds(pin);
+        releaseLedc(pin);
+        markOut(pin);
+        if (!::ledcAttach((uint8_t)pin, 50, XRT_LEDC_BITS))
+          return nfail("no quedan canales PWM libres para el servo del pin %d", pin);
+        servos[i].pin = (int8_t)pin;
+        servos[i].minUs = (uint16_t)mn;
+        servos[i].maxUs = (uint16_t)mx;
+        servos[i].us = 0;
+        return i + 1;
+      }
+      case NF_SERVO_WRITE: case NF_SERVO_WRITE_US: {
+        ServoCh* s = servoOf(a[0]);
+        if (!s) return 0;
+        double v = a[1];
+        if (fn == NF_SERVO_WRITE && v < s->minUs) {   // como la libreria Servo: < min es un angulo
+          if (v < 0) v = 0;
+          if (v > 180) v = 180;
+          v = s->minUs + (s->maxUs - s->minUs) * v / 180.0;
+        }
+        servoWriteUs(*s, v);
+        return 0;
+      }
+      case NF_SERVO_READ: {
+        ServoCh* s = servoOf(a[0]);
+        if (!s) return 0;
+        if (s->us == 0) return 90;
+        return (double)lround((s->us - s->minUs) * 180.0 / (s->maxUs - s->minUs));
+      }
+      case NF_SERVO_READ_US: {
+        ServoCh* s = servoOf(a[0]);
+        if (!s) return 0;
+        return s->us ? s->us : 1500;
+      }
+      case NF_SERVO_ATTACHED: {
+        int i = (int)a[0] - 1;
+        return i >= 0 && i < 16 && servos[i].pin >= 0;
+      }
+      case NF_SERVO_DETACH: {
+        int i = (int)a[0] - 1;
+        if (i >= 0 && i < 16 && servos[i].pin >= 0) {
+          releaseLedc(servos[i].pin);
+          servos[i].pin = -1;
+        }
+        return 0;
+      }
+
+      // ---------------- sistema ----------------
+      case NF_ESP_RESTART: ESP.restart(); return 0;
+      case NF_ESP_FREEHEAP: return ESP.getFreeHeap();
+      case NF_ESP_HEAPSIZE: return ESP.getHeapSize();
+      case NF_ESP_CPUFREQ: return getCpuFrequencyMhz();
+      case NF_ESP_CORES: return ESP.getChipCores();
+      case NF_ESP_FLASHSIZE: return ESP.getFlashChipSize();
+      case NF_ESP_MAC: return (double)ESP.getEfuseMac();
+      case NF_TEMPERATURE: return ::temperatureRead();
+      case NF_AREAD_MV: return ::analogReadMilliVolts((uint8_t)a[0]);
+      case NF_ASET_ATTEN:
+        if (a[0] < 0 || a[0] > 3) return nfail("usa ADC_0db, ADC_2_5db, ADC_6db o ADC_11db");
+        ::analogSetAttenuation((adc_attenuation_t)(int)a[0]);
+        return 0;
+      case NF_ASET_PIN_ATTEN:
+        if (a[1] < 0 || a[1] > 3) return nfail("usa ADC_0db, ADC_2_5db, ADC_6db o ADC_11db");
+        ::analogSetPinAttenuation((uint8_t)a[0], (adc_attenuation_t)(int)a[1]);
+        return 0;
+      case NF_RGBLED: {
+        int pin = (int)a[0];
+        if (!isRgb(pin) && !pinOk(pin, true)) return 0;
+#if SOC_RMT_SUPPORTED
+        if (isRgb(pin)) rgbUsed = true;
+        else if (pin < 64) { rgbPins |= 1ULL << pin; outPins |= 1ULL << pin; }
+        ::rgbLedWrite((uint8_t)pin, (uint8_t)a[1], (uint8_t)a[2], (uint8_t)a[3]);
+        return 0;
+#else
+        return nfail("este ESP32 no puede controlar LEDs RGB");
+#endif
+      }
+      case NF_SET_CPUFREQ: {
+        int mhz = (int)a[0];
+        if (mhz < 80) return nfail("por debajo de 80 MHz dejan de funcionar el Bluetooth y el USB");
+        if (!bootCpuMhz) bootCpuMhz = getCpuFrequencyMhz();
+        return ::setCpuFrequencyMhz((uint32_t)mhz);
+      }
+      case NF_ESP_RANDOM: return (double)esp_random();
+      case NF_ESP_TIMER_US: return (double)esp_timer_get_time();
+      default:
+        return nfail("esta funcion no esta disponible en el firmware");
+    }
+  }
+
+  void endTimer(UserTimer& u) {
+    if (!u.t) return;
+    u.armed = false;
+    int s = u.slot;
+    u.slot = -1;
+    ::timerEnd(u.t);
+    u.t = nullptr;
+    freeSlot(s);
+  }
+
   // Deja los pines en un estado seguro al detener un programa
   void resetHardware() {
+    // primero se paran todas las fuentes de interrupciones
+    for (int c = 0; c < DDS_MAX; c++) dds[c].kind = DDS_OFF;
+    if (ddsTimer) { ::timerEnd(ddsTimer); ddsTimer = nullptr; }
+    for (int c = 0; c < DDS_MAX; c++) dds[c].pin = -1;
+    for (int k = 0; k < MAX_UTIMERS; k++) endTimer(utm[k]);
+    for (int p = 0; p < SOC_GPIO_PIN_COUNT; p++) {
+      if (pinIrq[p].active) ::detachInterrupt((uint8_t)p);
+      pinIrq[p].active = false;
+      pinIrq[p].counter = false;
+      pinIrq[p].slot = -1;
+      pinIrq[p].count = 0;
+    }
+    slotUsed = 0;
+    portENTER_CRITICAL(&evMux);
+    for (int s = 0; s < 32; s++) evCount[s] = 0;
+    eventBits = 0;
+    portEXIT_CRITICAL(&evMux);
+    if (evSem) xSemaphoreTake(evSem, 0);
+    for (int b = 0; b < 2; b++) {
+      TwoWire* w = wireBus(b);
+      if (wireUsed[b] && w) w->end();
+      wireUsed[b] = false;
+    }
+    if (spiUsed) SPI.end();
+    spiUsed = false;
+#if SOC_RMT_SUPPORTED
+    for (int p = 0; p < 64; p++)
+      if (rgbPins & (1ULL << p)) ::rgbLedWrite((uint8_t)p, 0, 0, 0);
+#endif
     for (int p = 0; p < 64; p++) {
       uint64_t b = 1ULL << p;
       if (!(outPins & b)) continue;
       if (tonePins & b) ::noTone(p);
       if (pwmPins & b) ::analogWrite(p, 0);
-      ::pinMode(p, INPUT);
+      ::pinMode(p, INPUT);   // tambien suelta PWM, DAC y sigma-delta
     }
 #ifdef RGB_BUILTIN
     if (rgbUsed) ::digitalWrite(RGB_BUILTIN, LOW);
 #endif
-    outPins = pwmPins = tonePins = 0;
+    if (bootCpuMhz && getCpuFrequencyMhz() != bootCpuMhz) ::setCpuFrequencyMhz(bootCpuMhz);
+    outPins = pwmPins = tonePins = rgbPins = 0;
     rgbUsed = false;
+    clearTables();
   }
 };
 
@@ -763,6 +1748,7 @@ static void vmStep() {
 
 static void vmTask(void* arg) {
   bool safeBoot = arg != nullptr;
+  evSem = xSemaphoreCreateBinary();
   if (safeBoot) {
     Serial.println("[X-RTbox] Arranque seguro (BOOT pulsado): no se ejecuta el programa guardado");
   } else {

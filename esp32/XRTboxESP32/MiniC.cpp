@@ -37,18 +37,18 @@ static const int MAX_ARGS = 10;          // argumentos por llamada
 // ---------------------------------------------------------------------
 enum Ty : uint8_t {
   TY_VOID, TY_BOOL, TY_CHAR, TY_U8, TY_I8, TY_I16, TY_U16, TY_I32, TY_U32,
-  TY_I64, TY_U64, TY_FLOAT, TY_DOUBLE, TY_STRING, TY_ANY, TY__COUNT
+  TY_I64, TY_U64, TY_FLOAT, TY_DOUBLE, TY_STRING, TY_ANY, TY_SERVO, TY_SPISET, TY__COUNT
 };
-static const uint8_t kTyBits[TY__COUNT] = {0, 1, 8, 8, 8, 16, 16, 32, 32, 64, 64, 0, 0, 0, 0};
+static const uint8_t kTyBits[TY__COUNT] = {0, 1, 8, 8, 8, 16, 16, 32, 32, 64, 64, 0, 0, 0, 0, 32, 64};
 static const bool kTyUns[TY__COUNT] = {false, true, false, true, false, false, true, false, true,
-                                       false, true, false, false, false, false};
-static const uint8_t kTySize[TY__COUNT] = {0, 1, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 12, 4};
+                                       false, true, false, false, false, false, false, false};
+static const uint8_t kTySize[TY__COUNT] = {0, 1, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 12, 4, 4, 8};
 static inline bool tyIsInt(uint8_t t) { return t >= TY_BOOL && t <= TY_U64; }
 
 // ---------------------------------------------------------------------
 //  Valores en tiempo de ejecucion
 // ---------------------------------------------------------------------
-enum VT : uint8_t { V_VOID, V_INT, V_FLT, V_STR, V_ARR, V_REF };
+enum VT : uint8_t { V_VOID, V_INT, V_FLT, V_STR, V_ARR, V_REF, V_FUNC };
 
 struct StrObj;
 struct ArrObj;
@@ -92,6 +92,7 @@ struct Value {
   static Value S(std::string&& s);
   static Value Ref(Value* p) { Value x; x.t = V_REF; x.r = p; return x; }
   static Value A(ArrObj* a) { Value x; x.t = V_ARR; x.a = a; return x; }
+  static Value Fn(int idx) { Value x; x.t = V_FUNC; x.i = idx; return x; }
   bool isNum() const { return t == V_INT || t == V_FLT; }
 };
 
@@ -133,7 +134,9 @@ enum NodeKind : uint8_t {
   N_METHOD, N_INDEX, N_CAST, N_SIZEOF, N_COMMA, N_INITLIST,
   // sentencias
   N_BLOCK, N_EXPR, N_DECL, N_IF, N_WHILE, N_DOWHILE, N_FOR, N_FOREACH, N_BREAK, N_CONTINUE,
-  N_RETURN, N_SWITCH, N_CASE, N_DEFAULT, N_EMPTY, N_DIM
+  N_RETURN, N_SWITCH, N_CASE, N_DEFAULT, N_EMPTY, N_DIM,
+  // referencia a funcion (para interrupciones) y &variable
+  N_FUNCREF, N_ADDR
 };
 
 struct Node {
@@ -244,10 +247,178 @@ static const BuiltinDef kBuiltins[B__COUNT] = {
   {"Serial.flush", 0, 0}, {"Serial.setTimeout", 1, 1}, {"String", 2, 2}, {"strlen", 1, 1},
 };
 
+// ---------------------------------------------------------------------
+//  Funciones del ESP32 (las ejecuta el firmware con Hal::native) y
+//  funciones especiales que resuelve el propio interprete (codigo < 0)
+// ---------------------------------------------------------------------
+enum NativeFlags { XF_SELF = 1, XF_BUS = 2, XF_NOEVAL = 4 };
+enum XSpecial {
+  XS_ATTACH_INT = -1, XS_DETACH_INT = -2, XS_TIMER_BEGIN = -3, XS_TIMER_ATTACH = -4,
+  XS_TIMER_DETACH = -5, XS_NOINT = -6, XS_INT = -7, XS_CRIT_ENTER = -8, XS_CRIT_EXIT = -9,
+  XS_PIN2INT = -10, XS_FREQ_READ = -11, XS_SPISETTINGS = -12, XS_WIRE_WRITE = -13,
+  XS_SPI_TRANSFER = -14, XS_STR = -15, XS_FMIN = -16, XS_FMAX = -17, XS_HYPOT = -18,
+  XS_TRUNC = -19, XS_CBRT = -20
+};
+
+struct NativeDef {
+  const char* name;
+  int8_t minA, maxA;  // en los metodos de Servo incluye el propio objeto
+  int16_t nf;         // NativeFn (> 0) o XSpecial (< 0)
+  char ret;           // 'v' nada, 'i' entero, 'b' bool, 'f' decimal, 's' texto
+  int8_t pinArg;      // argumento que es un pin (-1 ninguno), sin contar el objeto
+  bool pinOut;
+  uint8_t flags;
+  int16_t aux;
+};
+
+static const NativeDef kNatives[] = {
+  // PWM / LEDC (nombres del core 3.x y del 2.x)
+  {"ledcAttach", 3, 3, NF_LEDC_ATTACH, 'b', 0, true, 0, 0},
+  {"ledcAttachChannel", 4, 4, NF_LEDC_ATTACH_CH, 'b', 0, true, 0, 0},
+  {"ledcSetup", 3, 3, NF_LEDC_SETUP, 'f', -1, false, 0, 0},
+  {"ledcAttachPin", 2, 2, NF_LEDC_ATTACH_PIN, 'v', 0, true, 0, 0},
+  {"ledcDetach", 1, 1, NF_LEDC_DETACH, 'b', 0, true, 0, 0},
+  {"ledcDetachPin", 1, 1, NF_LEDC_DETACH, 'b', 0, true, 0, 0},
+  {"ledcWrite", 2, 2, NF_LEDC_WRITE, 'b', -1, false, 0, 0},
+  {"ledcWriteTone", 2, 2, NF_LEDC_TONE, 'i', -1, false, 0, 0},
+  {"ledcWriteNote", 3, 3, NF_LEDC_NOTE, 'i', -1, false, 0, 0},
+  {"ledcRead", 1, 1, NF_LEDC_READ, 'i', -1, false, 0, 0},
+  {"ledcReadFreq", 1, 1, NF_LEDC_READ_FREQ, 'i', -1, false, 0, 0},
+  {"ledcChangeFrequency", 3, 3, NF_LEDC_CHANGE_FREQ, 'i', -1, false, 0, 0},
+  {"ledcFade", 4, 4, NF_LEDC_FADE, 'b', 0, true, 0, 0},
+  {"analogWriteFrequency", 1, 2, NF_AW_FREQ, 'v', -1, false, 0, 0},
+  {"analogWriteResolution", 1, 2, NF_AW_RES, 'v', -1, false, 0, 0},
+  // generadores de senal por hardware (X-RTbox)
+  {"signalSine", 2, 4, NF_SIG_SINE, 'f', 0, true, 0, 0},
+  {"signalTriangle", 2, 4, NF_SIG_TRIANGLE, 'f', 0, true, 0, 0},
+  {"signalSawtooth", 2, 4, NF_SIG_SAW, 'f', 0, true, 0, 0},
+  {"signalSquare", 2, 3, NF_SIG_SQUARE, 'f', 0, true, 0, 0},
+  {"signalStop", 1, 1, NF_SIG_STOP, 'v', 0, true, 0, 0},
+  {"senoidal", 2, 4, NF_SIG_SINE, 'f', 0, true, 0, 0},
+  {"triangular", 2, 4, NF_SIG_TRIANGLE, 'f', 0, true, 0, 0},
+  {"dienteDeSierra", 2, 4, NF_SIG_SAW, 'f', 0, true, 0, 0},
+  {"cuadrada", 2, 3, NF_SIG_SQUARE, 'f', 0, true, 0, 0},
+  {"pararSenal", 1, 1, NF_SIG_STOP, 'v', 0, true, 0, 0},
+  {"dacDisable", 1, 1, NF_DAC_DISABLE, 'v', 0, true, 0, 0},
+  // medida
+  {"pulseCounterStart", 1, 2, NF_CNT_START, 'b', 0, false, 0, 0},
+  {"pulseCounterRead", 1, 1, NF_CNT_READ, 'i', 0, false, 0, 0},
+  {"pulseCounterReset", 1, 1, NF_CNT_RESET, 'v', 0, false, 0, 0},
+  {"pulseCounterStop", 1, 1, NF_CNT_STOP, 'v', 0, false, 0, 0},
+  {"frequencyRead", 1, 2, XS_FREQ_READ, 'f', 0, false, 0, 0},
+  {"medirFrecuencia", 1, 2, XS_FREQ_READ, 'f', 0, false, 0, 0},
+  {"pulseInLong", 2, 3, NF_PULSEIN_LONG, 'i', 0, false, 0, 0},
+  // interrupciones
+  {"attachInterrupt", 3, 3, XS_ATTACH_INT, 'v', 0, false, 0, 0},
+  {"detachInterrupt", 1, 1, XS_DETACH_INT, 'v', 0, false, 0, 0},
+  {"digitalPinToInterrupt", 1, 1, XS_PIN2INT, 'i', -1, false, 0, 0},
+  {"noInterrupts", 0, 0, XS_NOINT, 'v', -1, false, XF_NOEVAL, 0},
+  {"interrupts", 0, 0, XS_INT, 'v', -1, false, XF_NOEVAL, 0},
+  {"portENTER_CRITICAL", 1, 1, XS_CRIT_ENTER, 'v', -1, false, XF_NOEVAL, 0},
+  {"portEXIT_CRITICAL", 1, 1, XS_CRIT_EXIT, 'v', -1, false, XF_NOEVAL, 0},
+  {"portENTER_CRITICAL_ISR", 1, 1, XS_CRIT_ENTER, 'v', -1, false, XF_NOEVAL, 0},
+  {"portEXIT_CRITICAL_ISR", 1, 1, XS_CRIT_EXIT, 'v', -1, false, XF_NOEVAL, 0},
+  // temporizadores (estilo core 3.x y 2.x)
+  {"timerBegin", 1, 3, XS_TIMER_BEGIN, 'i', -1, false, 0, 0},
+  {"timerAttachInterrupt", 2, 3, XS_TIMER_ATTACH, 'v', -1, false, 0, 0},
+  {"timerDetachInterrupt", 1, 1, XS_TIMER_DETACH, 'v', -1, false, 0, 0},
+  {"timerAlarm", 2, 4, NF_TIMER_ALARM, 'v', -1, false, 0, 0},
+  {"timerAlarmWrite", 2, 3, NF_TIMER_ALARM_WRITE, 'v', -1, false, 0, 0},
+  {"timerAlarmEnable", 1, 1, NF_TIMER_ALARM_ENABLE, 'v', -1, false, 0, 0},
+  {"timerAlarmDisable", 1, 1, NF_TIMER_ALARM_DISABLE, 'v', -1, false, 0, 0},
+  {"timerStart", 1, 1, NF_TIMER_START, 'v', -1, false, 0, 0},
+  {"timerStop", 1, 1, NF_TIMER_STOP, 'v', -1, false, 0, 0},
+  {"timerRestart", 1, 1, NF_TIMER_RESTART, 'v', -1, false, 0, 0},
+  {"timerEnd", 1, 1, NF_TIMER_END, 'v', -1, false, 0, 0},
+  {"timerRead", 1, 1, NF_TIMER_READ, 'i', -1, false, 0, 0},
+  {"timerReadMicros", 1, 1, NF_TIMER_READ_US, 'i', -1, false, 0, 0},
+  {"timerReadMillis", 1, 1, NF_TIMER_READ_MS, 'i', -1, false, 0, 0},
+  {"timerReadSeconds", 1, 1, NF_TIMER_READ_S, 'f', -1, false, 0, 0},
+  {"timerWrite", 2, 2, NF_TIMER_WRITE, 'v', -1, false, 0, 0},
+  // I2C: Wire y Wire1
+  {"Wire.begin", 0, 3, NF_WIRE_BEGIN, 'b', -1, false, XF_BUS, 0},
+  {"Wire.end", 0, 0, NF_WIRE_END, 'b', -1, false, XF_BUS, 0},
+  {"Wire.setClock", 1, 1, NF_WIRE_CLOCK, 'v', -1, false, XF_BUS, 0},
+  {"Wire.getClock", 0, 0, NF_WIRE_GETCLOCK, 'i', -1, false, XF_BUS, 0},
+  {"Wire.beginTransmission", 1, 1, NF_WIRE_BEGINTX, 'v', -1, false, XF_BUS, 0},
+  {"Wire.write", 1, 2, XS_WIRE_WRITE, 'i', -1, false, XF_BUS, 0},
+  {"Wire.endTransmission", 0, 1, NF_WIRE_ENDTX, 'i', -1, false, XF_BUS, 0},
+  {"Wire.requestFrom", 2, 3, NF_WIRE_REQUEST, 'i', -1, false, XF_BUS, 0},
+  {"Wire.available", 0, 0, NF_WIRE_AVAILABLE, 'i', -1, false, XF_BUS, 0},
+  {"Wire.read", 0, 0, NF_WIRE_READ, 'i', -1, false, XF_BUS, 0},
+  {"Wire.peek", 0, 0, NF_WIRE_PEEK, 'i', -1, false, XF_BUS, 0},
+  // SPI
+  {"SPI.begin", 0, 4, NF_SPI_BEGIN, 'v', -1, false, 0, 0},
+  {"SPI.end", 0, 0, NF_SPI_END, 'v', -1, false, 0, 0},
+  {"SPI.beginTransaction", 1, 1, NF_SPI_BEGINTX, 'v', -1, false, 0, 0},
+  {"SPI.endTransaction", 0, 0, NF_SPI_ENDTX, 'v', -1, false, 0, 0},
+  {"SPI.transfer", 1, 2, XS_SPI_TRANSFER, 'i', -1, false, 0, 0},
+  {"SPI.transfer16", 1, 1, NF_SPI_TRANSFER16, 'i', -1, false, 0, 0},
+  {"SPI.transfer32", 1, 1, NF_SPI_TRANSFER32, 'i', -1, false, 0, 0},
+  {"SPI.setFrequency", 1, 1, NF_SPI_FREQ, 'v', -1, false, 0, 0},
+  {"SPI.setDataMode", 1, 1, NF_SPI_MODE, 'v', -1, false, 0, 0},
+  {"SPI.setBitOrder", 1, 1, NF_SPI_ORDER, 'v', -1, false, 0, 0},
+  {"SPI.write", 1, 1, NF_SPI_WRITE, 'v', -1, false, 0, 0},
+  {"SPI.write16", 1, 1, NF_SPI_WRITE16, 'v', -1, false, 0, 0},
+  {"SPI.write32", 1, 1, NF_SPI_WRITE32, 'v', -1, false, 0, 0},
+  {"SPISettings", 0, 3, XS_SPISETTINGS, 'i', -1, false, 0, 0},
+  // Servo (metodos sobre una variable Servo)
+  {"Servo.attach", 2, 4, NF_SERVO_ATTACH, 'i', 0, true, XF_SELF, 0},
+  {"Servo.write", 2, 2, NF_SERVO_WRITE, 'v', -1, false, XF_SELF, 0},
+  {"Servo.writeMicroseconds", 2, 2, NF_SERVO_WRITE_US, 'v', -1, false, XF_SELF, 0},
+  {"Servo.read", 1, 1, NF_SERVO_READ, 'i', -1, false, XF_SELF, 0},
+  {"Servo.readMicroseconds", 1, 1, NF_SERVO_READ_US, 'i', -1, false, XF_SELF, 0},
+  {"Servo.attached", 1, 1, NF_SERVO_ATTACHED, 'b', -1, false, XF_SELF, 0},
+  {"Servo.detach", 1, 1, NF_SERVO_DETACH, 'v', -1, false, XF_SELF, 0},
+  // sistema
+  {"ESP.restart", 0, 0, NF_ESP_RESTART, 'v', -1, false, 0, 0},
+  {"ESP.getFreeHeap", 0, 0, NF_ESP_FREEHEAP, 'i', -1, false, 0, 0},
+  {"ESP.getHeapSize", 0, 0, NF_ESP_HEAPSIZE, 'i', -1, false, 0, 0},
+  {"ESP.getCpuFreqMHz", 0, 0, NF_ESP_CPUFREQ, 'i', -1, false, 0, 0},
+  {"ESP.getChipCores", 0, 0, NF_ESP_CORES, 'i', -1, false, 0, 0},
+  {"ESP.getFlashChipSize", 0, 0, NF_ESP_FLASHSIZE, 'i', -1, false, 0, 0},
+  {"ESP.getEfuseMac", 0, 0, NF_ESP_MAC, 'i', -1, false, 0, 0},
+  {"ESP.getChipModel", 0, 0, XS_STR, 's', -1, false, 0, NS_CHIP_MODEL},
+  {"ESP.getSdkVersion", 0, 0, XS_STR, 's', -1, false, 0, NS_SDK_VERSION},
+  {"temperatureRead", 0, 0, NF_TEMPERATURE, 'f', -1, false, 0, 0},
+  {"analogReadMilliVolts", 1, 1, NF_AREAD_MV, 'i', 0, false, 0, 0},
+  {"analogSetAttenuation", 1, 1, NF_ASET_ATTEN, 'v', -1, false, 0, 0},
+  {"analogSetPinAttenuation", 2, 2, NF_ASET_PIN_ATTEN, 'v', 0, false, 0, 0},
+  {"rgbLedWrite", 4, 4, NF_RGBLED, 'v', -1, false, 0, 0},
+  {"neopixelWrite", 4, 4, NF_RGBLED, 'v', -1, false, 0, 0},
+  {"setCpuFrequencyMhz", 1, 1, NF_SET_CPUFREQ, 'b', -1, false, 0, 0},
+  {"getCpuFrequencyMhz", 0, 0, NF_ESP_CPUFREQ, 'i', -1, false, 0, 0},
+  {"esp_random", 0, 0, NF_ESP_RANDOM, 'i', -1, false, 0, 0},
+  {"esp_timer_get_time", 0, 0, NF_ESP_TIMER_US, 'i', -1, false, 0, 0},
+  {"fmin", 2, 2, XS_FMIN, 'f', -1, false, 0, 0},
+  {"fmax", 2, 2, XS_FMAX, 'f', -1, false, 0, 0},
+  {"hypot", 2, 2, XS_HYPOT, 'f', -1, false, 0, 0},
+  {"trunc", 1, 1, XS_TRUNC, 'f', -1, false, 0, 0},
+  {"cbrt", 1, 1, XS_CBRT, 'f', -1, false, 0, 0},
+};
+static const int kNativeCount = (int)(sizeof(kNatives) / sizeof(kNatives[0]));
+
 static int findBuiltin(const std::string& name) {
   for (int k = 0; k < B__COUNT; k++)
     if (name == kBuiltins[k].name) return k;
+  for (int k = 0; k < kNativeCount; k++)
+    if (name == kNatives[k].name) return B__COUNT + k;
   return -1;
+}
+
+static void builtinRange(int bi, int& lo, int& hi, const char*& name) {
+  if (bi < B__COUNT) {
+    lo = kBuiltins[bi].minA;
+    hi = kBuiltins[bi].maxA;
+    name = kBuiltins[bi].name;
+  } else {
+    const NativeDef& d = kNatives[bi - B__COUNT];
+    int self = (d.flags & XF_SELF) ? 1 : 0;
+    lo = d.minA;
+    hi = d.maxA;
+    name = d.name;
+    (void)self;
+  }
 }
 
 enum MethodId {
@@ -691,7 +862,8 @@ Token Lexer::next() {
   for (;;) {
     Token t = rawNext();
     if (t.type != TK_IDENT) return t;
-    if (t.text == "PROGMEM" || t.text == "IRAM_ATTR" || t.text == "ICACHE_RAM_ATTR" || t.text == "DRAM_ATTR")
+    if (t.text == "PROGMEM" || t.text == "IRAM_ATTR" || t.text == "ICACHE_RAM_ATTR" || t.text == "DRAM_ATTR" ||
+        t.text == "ARDUINO_ISR_ATTR")
       continue;
     if (t.mdepth >= 16) return t;
     std::map<std::string, Macro>::iterator it = macros.find(t.text);
@@ -771,10 +943,16 @@ struct Impl {
   bool abort_;
   uint32_t steps;
   uint32_t rng;
+  // interrupciones diferidas: bit del evento -> funcion del programa
+  int eventFunc[32];
+  int eventMask;
+  bool inEvent;
 
   Impl(Hal& h, std::string& e, std::atomic<bool>& s)
       : hal(h), err(e), stopReq(s), setupIdx(-1), loopIdx(-1), loaded(false), sp(0), fp(0), depth(0),
-        abort_(false), steps(0), rng(0x2545F491u) {}
+        abort_(false), steps(0), rng(0x2545F491u), eventMask(0), inEvent(false) {
+    for (int k = 0; k < 32; k++) eventFunc[k] = -1;
+  }
 
   void clearProgram() {
     globals.clear();
@@ -834,7 +1012,7 @@ struct Impl {
     switch (v.t) {
       case V_INT: return v.i != 0;
       case V_FLT: return v.f != 0.0;
-      case V_STR: case V_ARR: return true;
+      case V_STR: case V_ARR: case V_FUNC: return true;
       default: return false;
     }
   }
@@ -843,6 +1021,7 @@ struct Impl {
       case V_STR: return "un String";
       case V_ARR: return "un array";
       case V_VOID: return "un valor vacio (void)";
+      case V_FUNC: return "una funcion";
       default: return "un numero";
     }
   }
@@ -886,6 +1065,7 @@ struct Impl {
         return buf;
       }
       case V_ARR: return "[array]";
+      case V_FUNC: return "[funcion]";
       default: return "";
     }
   }
@@ -937,6 +1117,8 @@ struct Impl {
   bool bindArgs(Func& f, Node* args, int newfp, int line) NOINLINE;
   Value finishCall(Func& f, int line) NOINLINE;
   Value builtin(Node* n) NOINLINE;
+  Value nativeCall(Node* n) NOINLINE;
+  void dispatchEvents(int line) NOINLINE;
   Value method(Node* n) NOINLINE;
   void execDecl(Node* n) NOINLINE;
   Value makeArray(const std::vector<int>& dims, size_t level, uint8_t ty, Node* init, int line);
@@ -1136,7 +1318,22 @@ private:
   Node* parseIdentifier(const Token& t);
   static int binPrec(const Token& t);
   bool isLvalue(Node* n) { return n && (n->kind == N_LVAR || n->kind == N_GVAR || n->kind == N_INDEX); }
+  static uint8_t staticType(Node* n) {
+    if (!n) return TY_ANY;
+    if (n->kind == N_LVAR || n->kind == N_GVAR) return n->op;
+    if (n->kind == N_INDEX) return staticType(n->a);
+    return TY_ANY;
+  }
   bool resolveCalls();
+  const char* pendingName(Node* n) {
+    for (size_t k = 0; k < pendingCalls.size(); k++)
+      if (pendingCalls[k].n == n) return pendingCalls[k].name.c_str();
+    return "?";
+  }
+  bool undeclared(Node* e, int line) {
+    if (e && e->kind == N_FUNCREF) { failAt(line, "'%s' no esta declarado", pendingName(e)); return true; }
+    return false;
+  }
 };
 
 bool Parser::isTypeWord(const std::string& s) {
@@ -1144,7 +1341,7 @@ bool Parser::isTypeWord(const std::string& s) {
     "void", "bool", "boolean", "char", "byte", "short", "int", "long", "unsigned", "signed", "float",
     "double", "String", "size_t", "uint8_t", "int8_t", "uint16_t", "int16_t", "uint32_t", "int32_t",
     "uint64_t", "int64_t", "word", "auto", "const", "constexpr", "static", "volatile", "inline", "extern",
-    "register", nullptr};
+    "register", "Servo", "SPISettings", "hw_timer_t", "portMUX_TYPE", "esp_timer_handle_t", nullptr};
   for (int k = 0; words[k]; k++)
     if (s == words[k]) return true;
   return typeAliases.count(s) > 0;
@@ -1197,6 +1394,9 @@ int Parser::parseType(bool& isStatic, bool& isConst, bool allowRef, bool& isRef)
     else if (s == "double") b = TY_DOUBLE;
     else if (s == "String") b = TY_STRING;
     else if (s == "auto") b = TY_ANY;
+    else if (s == "Servo") b = TY_SERVO;
+    else if (s == "SPISettings") b = TY_SPISET;
+    else if (s == "hw_timer_t" || s == "portMUX_TYPE" || s == "esp_timer_handle_t") b = TY_I32;
     else if (typeAliases.count(s)) b = typeAliases[s];
     if (b == -2) break;
     skip();
@@ -1477,6 +1677,19 @@ Node* Parser::parseDeclarator(uint8_t ty, bool isStatic, const std::string& name
     init = isOp('{') ? parseInitList() : parseAssign();
   } else if (isOp('{')) {
     init = parseInitList();
+  } else if (isOp('(') && !ndims && ty == TY_SPISET) {  // SPISettings s(1000000, MSBFIRST, SPI_MODE0);
+    skip();
+    int argc;
+    Node* args = parseArgs(argc);
+    if (failed) return nullptr;
+    init = mk(N_PCALL, line);
+    if (!init) return nullptr;
+    init->b = args;
+    init->ival = argc;
+    PendingCall pc;
+    pc.n = init;
+    pc.name = "SPISettings";
+    pendingCalls.push_back(pc);
   } else if (isOp('(') && !ndims) {  // String s("hola");  int x(5);
     skip();
     if (!isOp(')')) init = parseAssign();
@@ -1785,6 +1998,7 @@ Node* Parser::parseAssign() {
   int aop = assignOpOf(peek());
   if (aop) {
     int line = takeLine();
+    if (undeclared(lhs, line)) return nullptr;
     if (!isLvalue(lhs)) { failAt(line, "solo se puede asignar a una variable o a un elemento de array"); return nullptr; }
     Node* rhs = parseAssign();
     if (failed) return nullptr;
@@ -1869,7 +2083,15 @@ Node* Parser::parseUnary() {
       case OP_INC: kind = N_PREINC; break;
       case OP_DEC: kind = N_PREDEC; break;
       case '*': failAt(line, "los punteros (*p) no estan soportados; usa arrays"); return nullptr;
-      case '&': failAt(line, "los punteros (&x) no estan soportados; usa parametros por referencia"); return nullptr;
+      case '&': {
+        skip();
+        Node* a = parseUnary();
+        if (failed) return nullptr;
+        if (a->kind == N_FUNCREF) return a;   // &miFuncion (interrupciones)
+        Node* n = mk(N_ADDR, line);
+        if (n) n->a = a;
+        return n;
+      }
       default: break;
     }
     if (kind >= 0) {
@@ -1878,6 +2100,7 @@ Node* Parser::parseUnary() {
       Node* a = parseUnary();
       nest--;
       if (failed) return nullptr;
+      if ((kind == N_PREINC || kind == N_PREDEC) && undeclared(a, line)) return nullptr;
       if ((kind == N_PREINC || kind == N_PREDEC) && !isLvalue(a)) {
         failAt(line, "++ y -- solo funcionan con variables");
         return nullptr;
@@ -1931,6 +2154,7 @@ Node* Parser::parsePostfix(Node* e) {
       continue;
     }
     if (t.op == OP_INC || t.op == OP_DEC) {
+      if (undeclared(e, line)) return nullptr;
       if (!isLvalue(e)) { failAt(line, "++ y -- solo funcionan con variables"); return nullptr; }
       Node* n = mk(t.op == OP_INC ? N_POSTINC : N_POSTDEC, line);
       skip();
@@ -1943,6 +2167,27 @@ Node* Parser::parsePostfix(Node* e) {
       skip();
       std::string mname;
       if (!expectIdent(mname)) return nullptr;
+      if (undeclared(e, line)) return nullptr;
+      if (staticType(e) == TY_SERVO) {
+        std::string full = "Servo." + mname;
+        if (findBuiltin(full) < 0) { failAt(line, "Servo no tiene el metodo '.%s()'", mname.c_str()); return nullptr; }
+        if (!isLvalue(e)) { failAt(line, "los metodos de Servo se usan sobre una variable Servo"); return nullptr; }
+        if (!expectOp('(')) return nullptr;
+        int argc;
+        Node* args = parseArgs(argc);
+        if (failed) return nullptr;
+        Node* n = mk(N_PCALL, line);
+        if (!n) return nullptr;
+        e->next = args;
+        n->b = e;
+        n->ival = argc + 1;
+        PendingCall pc;
+        pc.n = n;
+        pc.name = full;
+        pendingCalls.push_back(pc);
+        e = n;
+        continue;
+      }
       int mid = findMethod(mname);
       if (mid < 0) { failAt(line, "el metodo '.%s()' no esta soportado", mname.c_str()); return nullptr; }
       if (!expectOp('(')) return nullptr;
@@ -2000,7 +2245,14 @@ Node* Parser::parseIdentifier(const Token& t) {
     {"HIGH", 1}, {"LOW", 0}, {"INPUT", MC_INPUT}, {"OUTPUT", MC_OUTPUT}, {"INPUT_PULLUP", MC_INPUT_PULLUP},
     {"INPUT_PULLDOWN", MC_INPUT_PULLDOWN}, {"OUTPUT_OPEN_DRAIN", MC_OUTPUT_OPEN_DRAIN}, {"true", 1},
     {"false", 0}, {"DEC", 10}, {"HEX", 16}, {"OCT", 8}, {"BIN", 2}, {"LSBFIRST", 0}, {"MSBFIRST", 1},
-    {"NULL", 0}, {"nullptr", 0}, {"RISING", 1}, {"FALLING", 2}, {"CHANGE", 3}, {"INT_MAX", 2147483647LL},
+    {"NULL", 0}, {"nullptr", 0}, {"RISING", 1}, {"FALLING", 2}, {"CHANGE", 3}, {"ONLOW", 4}, {"ONHIGH", 5},
+    {"ONLOW_WE", 0x0C}, {"ONHIGH_WE", 0x0D}, {"SPI_MODE0", 0}, {"SPI_MODE1", 1}, {"SPI_MODE2", 2},
+    {"SPI_MODE3", 3}, {"SPI_MSBFIRST", 1}, {"SPI_LSBFIRST", 0}, {"ADC_0db", 0}, {"ADC_2_5db", 1},
+    {"ADC_6db", 2}, {"ADC_11db", 3}, {"ADC_ATTEN_DB_0", 0}, {"ADC_ATTEN_DB_2_5", 1}, {"ADC_ATTEN_DB_6", 2},
+    {"ADC_ATTEN_DB_11", 3}, {"ADC_ATTEN_DB_12", 3}, {"portMUX_INITIALIZER_UNLOCKED", 0}, {"NOTE_C", 0},
+    {"NOTE_Cs", 1}, {"NOTE_D", 2}, {"NOTE_Eb", 3}, {"NOTE_E", 4}, {"NOTE_F", 5}, {"NOTE_Fs", 6}, {"NOTE_G", 7},
+    {"NOTE_Gs", 8}, {"NOTE_A", 9}, {"NOTE_Bb", 10}, {"NOTE_B", 11}, {"RGB_BRIGHTNESS", 64},
+    {"MIN_PULSE_WIDTH", 544}, {"MAX_PULSE_WIDTH", 2400}, {"INT_MAX", 2147483647LL},
     {"INT_MIN", -2147483647LL - 1}, {"UINT32_MAX", 4294967295LL}, {"LONG_MAX", 2147483647LL}, {nullptr, 0}};
   for (int k = 0; ki[k].n; k++) {
     if (s == ki[k].n) {
@@ -2009,7 +2261,7 @@ Node* Parser::parseIdentifier(const Token& t) {
       return n;
     }
   }
-  if (s == "LED_BUILTIN") {
+  if (s == "LED_BUILTIN" || s == "RGB_BUILTIN") {
     Node* n = mk(N_NUM, line);
     if (n) n->ival = P.hal.ledBuiltin();
     return n;
@@ -2026,8 +2278,22 @@ Node* Parser::parseIdentifier(const Token& t) {
       return n;
     }
   }
-  failAt(line, "'%s' no esta declarado", s.c_str());
-  return nullptr;
+  {
+    int pc = P.hal.pinConstant(s);  // SDA, SCL, MOSI, DAC1...
+    if (pc >= 0) {
+      Node* n = mk(N_NUM, line);
+      if (n) n->ival = pc;
+      return n;
+    }
+  }
+  // puede ser el nombre de una funcion (attachInterrupt(pin, miFuncion, RISING))
+  Node* fr = mk(N_FUNCREF, line);
+  if (!fr) return nullptr;
+  PendingCall pc;
+  pc.n = fr;
+  pc.name = s;
+  pendingCalls.push_back(pc);
+  return fr;
 }
 
 Node* Parser::parseStringLit(int line, const std::string& first) {
@@ -2107,6 +2373,18 @@ Node* Parser::parseIdentExpr(const Token& t) {
     if (failed || !expectOp(')')) return nullptr;
     return n;
   }
+  if (s == "SPISettings" && isOp('(')) {
+    skip();
+    int argc;
+    Node* args = parseArgs(argc);
+    if (failed) return nullptr;
+    Node* n = mk(N_PCALL, line);
+    if (!n) return nullptr;
+    n->b = args; n->ival = argc;
+    PendingCall pc; pc.n = n; pc.name = s;
+    pendingCalls.push_back(pc);
+    return n;
+  }
   // conversion estilo funcion: int(x), String(x), String(x, HEX)
   if (isTypeWord(s) && isOp('(')) {
     uint8_t ty;
@@ -2158,28 +2436,41 @@ Node* Parser::parseIdentExpr(const Token& t) {
     }
     return n;
   }
-  // Serial.xxx(...)
-  if (s == "Serial" || s == "Serial0" || s == "USBSerial") {
-    if (isOp('.')) {
-      skip();
-      std::string m;
-      if (!expectIdent(m)) return nullptr;
-      std::string full = "Serial." + m;
-      if (findBuiltin(full) < 0) { failAt(line, "Serial.%s() no esta soportado", m.c_str()); return nullptr; }
-      if (!expectOp('(')) return nullptr;
-      int argc;
-      Node* args = parseArgs(argc);
-      if (failed) return nullptr;
-      Node* n = mk(N_PCALL, line);
-      if (!n) return nullptr;
-      n->b = args; n->ival = argc;
-      PendingCall pc; pc.n = n; pc.name = full;
-      pendingCalls.push_back(pc);
-      return n;
+  // Objetos integrados: Serial.x(), Wire.x(), Wire1.x(), SPI.x(), ESP.x()
+  {
+    const char* ns = nullptr;
+    int bus = 0;
+    if (s == "Serial" || s == "Serial0" || s == "USBSerial") ns = "Serial";
+    else if (s == "Wire") ns = "Wire";
+    else if (s == "Wire1") { ns = "Wire"; bus = 1; }
+    else if (s == "SPI") ns = "SPI";
+    else if (s == "ESP") ns = "ESP";
+    if (ns) {
+      if (isOp('.')) {
+        skip();
+        std::string m;
+        if (!expectIdent(m)) return nullptr;
+        std::string full = std::string(ns) + "." + m;
+        if (findBuiltin(full) < 0) { failAt(line, "%s.%s() no esta soportado", s.c_str(), m.c_str()); return nullptr; }
+        if (!expectOp('(')) return nullptr;
+        int argc;
+        Node* args = parseArgs(argc);
+        if (failed) return nullptr;
+        Node* n = mk(N_PCALL, line);
+        if (!n) return nullptr;
+        n->b = args; n->ival = argc; n->op = (uint8_t)bus;
+        PendingCall pc; pc.n = n; pc.name = full;
+        pendingCalls.push_back(pc);
+        return n;
+      }
+      if (ns[0] == 'S' && ns[1] == 'e') {  // while(!Serial)
+        Node* n = mk(N_NUM, line);
+        if (n) n->ival = 1;
+        return n;
+      }
+      failAt(line, "'%s' se usa con un punto, por ejemplo %s.begin()", s.c_str(), s.c_str());
+      return nullptr;
     }
-    Node* n = mk(N_NUM, line);  // while(!Serial)
-    if (n) n->ival = 1;
-    return n;
   }
   // Nombre::VALOR (enum class)
   if (isOp(OP_SCOPE) && typeAliases.count(s)) {
@@ -2190,10 +2481,6 @@ Node* Parser::parseIdentExpr(const Token& t) {
   }
   // llamada a funcion
   if (isOp('(')) {
-    if (s == "attachInterrupt" || s == "detachInterrupt") {
-      failAt(line, "las interrupciones (%s) no estan soportadas; lee el pin dentro de loop()", s.c_str());
-      return nullptr;
-    }
     skip();
     int argc;
     Node* args = parseArgs(argc);
@@ -2216,6 +2503,11 @@ bool Parser::resolveCalls() {
     int fi = -1;
     for (size_t q = 0; q < P.funcs.size(); q++)
       if (P.funcs[q].name == name) { fi = (int)q; break; }
+    if (n->kind == N_FUNCREF) {
+      if (fi < 0 || !P.funcs[fi].defined) { failAt(n->line, "'%s' no esta declarado", name.c_str()); return false; }
+      n->idx = fi;
+      continue;
+    }
     if (fi >= 0) {
       Func& f = P.funcs[fi];
       if (!f.defined) { failAt(n->line, "la funcion '%s' esta declarada pero no tiene cuerpo", name.c_str()); return false; }
@@ -2232,10 +2524,14 @@ bool Parser::resolveCalls() {
     }
     int bi = findBuiltin(name);
     if (bi >= 0) {
-      const BuiltinDef& bd = kBuiltins[bi];
-      if (argc < bd.minA || argc > bd.maxA) {
-        if (bd.minA == bd.maxA) failAt(n->line, "%s() necesita %d argumento(s) y se le pasan %d", name.c_str(), bd.minA, argc);
-        else failAt(n->line, "%s() necesita entre %d y %d argumentos y se le pasan %d", name.c_str(), bd.minA, bd.maxA, argc);
+      int lo, hi;
+      const char* bname;
+      builtinRange(bi, lo, hi, bname);
+      int shown = argc;
+      if (bi >= B__COUNT && (kNatives[bi - B__COUNT].flags & XF_SELF)) { lo--; hi--; shown--; }
+      if (shown < lo || shown > hi) {
+        if (lo == hi) failAt(n->line, "%s() necesita %d argumento(s) y se le pasan %d", name.c_str(), lo, shown);
+        else failAt(n->line, "%s() necesita entre %d y %d argumentos y se le pasan %d", name.c_str(), lo, hi, shown);
         return false;
       }
       if ((bi == B_BITSET || bi == B_BITCLEAR || bi == B_BITWRITE) && !isLvalue(n->b)) {
@@ -2246,9 +2542,7 @@ bool Parser::resolveCalls() {
       n->idx = bi;
       continue;
     }
-    if (name == "attachInterrupt" || name == "detachInterrupt")
-      failAt(n->line, "las interrupciones (%s) no estan soportadas; lee el pin dentro de loop()", name.c_str());
-    else if (name == "sprintf" || name == "snprintf" || name == "strcpy" || name == "strcat" || name == "malloc")
+    if (name == "sprintf" || name == "snprintf" || name == "strcpy" || name == "strcat" || name == "malloc")
       failAt(n->line, "%s() no esta soportado; usa String", name.c_str());
     else
       failAt(n->line, "la funcion '%s' no existe", name.c_str());
@@ -2549,6 +2843,11 @@ Value Impl::eval(Node* n) {
     case N_INITLIST:
       fail(n->line, "{ ... } solo se puede usar al declarar un array");
       return Value();
+    case N_FUNCREF:
+      return Value::Fn(n->idx);
+    case N_ADDR:
+      fail(n->line, "los punteros (&x) no estan soportados; usa parametros por referencia");
+      return Value();
     default:
       fail(n->line, "expresion no soportada");
       return Value();
@@ -2700,10 +2999,31 @@ void Impl::execDecl(Node* n) {
   *slot = defaultValue(n->op);
 }
 
+void Impl::dispatchEvents(int line) {
+  uint32_t bits = hal.takeEvents();
+  for (int b = 0; b < 32 && bits; b++) {
+    uint32_t m = 1u << b;
+    if (!(bits & m)) continue;
+    bits &= ~m;
+    int f = eventFunc[b];
+    uint32_t times = hal.takeEventCount(b);
+    if (f < 0 || times == 0) continue;
+    if (times > 2000) times = 2000;   // no bloquear el programa si se acumulan muchas
+    inEvent = true;
+    for (uint32_t t = 0; t < times && !abort_; t++) callUser(f, nullptr, line);
+    inEvent = false;
+    if (abort_) return;
+  }
+}
+
 bool Impl::sleepMs(uint32_t ms) {
   uint32_t start = hal.millis();
   for (;;) {
     if (checkStop()) return false;
+    if (hal.eventBits && !inEvent && eventMask == 0 && depth < MAX_CALL_DEPTH - 12) {
+      dispatchEvents(0);
+      if (abort_) return false;
+    }
     uint32_t el = hal.millis() - start;
     if (el >= ms) break;
     uint32_t left = ms - el;
@@ -2814,6 +3134,10 @@ Flow Impl::execSwitch(Node* n) {
 Flow Impl::exec(Node* n) {
   if (((++steps) & 1023) == 0) hal.yield();
   if (stopReq.load(std::memory_order_relaxed)) { stopAbort(); return F_ABORT; }
+  if (hal.eventBits && !inEvent && eventMask == 0 && depth < MAX_CALL_DEPTH - 12) {
+    dispatchEvents(n->line);
+    if (abort_) return F_ABORT;
+  }
   switch (n->kind) {
     case N_BLOCK:
       for (Node* s = n->a; s; s = s->next) {
@@ -2941,6 +3265,7 @@ std::string Impl::formatPrintf(const std::string& fmt, Value* av, int n, int lin
 static inline int64_t asInt(const Value& v) { return v.t == V_INT ? v.i : (v.t == V_FLT ? Impl::f2i(v.f) : 0); }
 
 Value Impl::builtin(Node* n) {
+  if (n->idx >= B__COUNT) return nativeCall(n);
   int id = n->idx;
   int argc = (int)n->ival;
   int line = n->line;
@@ -3222,6 +3547,210 @@ Value Impl::builtin(Node* n) {
   }
 }
 
+// ---- funciones del ESP32 ----
+Value Impl::nativeCall(Node* n) {
+  const NativeDef& d = kNatives[n->idx - B__COUNT];
+  int line = n->line;
+  if (d.flags & XF_NOEVAL) {  // secciones criticas: no se evaluan los argumentos
+    if (d.nf == XS_NOINT || d.nf == XS_CRIT_ENTER) eventMask++;
+    else if (eventMask > 0) eventMask--;
+    return Value();
+  }
+  Node* first = n->b;
+  Node* a = (d.flags & XF_SELF) ? (first ? first->next : nullptr) : first;
+  Value av[MAX_ARGS];
+  int na = 0;
+  for (; a && na < MAX_ARGS; a = a->next) {
+    av[na] = eval(a);
+    if (abort_) return Value();
+    na++;
+  }
+  // funciones que resuelve el interprete
+  switch (d.nf) {
+    case XS_STR: return Value::S(hal.nativeStr(d.aux));
+    case XS_PIN2INT: return av[0];
+    case XS_FMIN: case XS_FMAX: case XS_HYPOT: case XS_TRUNC: case XS_CBRT: {
+      for (int k = 0; k < na; k++)
+        if (!av[k].isNum()) { fail(line, "%s() necesita numeros", d.name); return Value(); }
+      double x = num(av[0]), y = na > 1 ? num(av[1]) : 0;
+      if (d.nf == XS_FMIN) return Value::F(x < y ? x : y);
+      if (d.nf == XS_FMAX) return Value::F(x > y ? x : y);
+      if (d.nf == XS_HYPOT) return Value::F(sqrt(x * x + y * y));
+      if (d.nf == XS_TRUNC) return Value::F(x < 0 ? ceil(x) : floor(x));
+      return Value::F(cbrt(x));
+    }
+    case XS_SPISETTINGS: {
+      int64_t clk = 1000000, order = 1, mode = 0;
+      if (na >= 1) clk = asInt(av[0]);
+      if (na >= 2) order = asInt(av[1]);
+      if (na >= 3) mode = asInt(av[2]);
+      Value v = Value::I((clk & 0xFFFFFFFFLL) | ((order & 0xFF) << 32) | ((mode & 0xFF) << 40));
+      return v;
+    }
+    case XS_WIRE_WRITE: {
+      double args[3];
+      args[0] = n->op;
+      int64_t count = 0;
+      std::vector<int> bytes;
+      if (av[0].t == V_STR) {
+        for (size_t k = 0; k < av[0].s->s.size(); k++) bytes.push_back((unsigned char)av[0].s->s[k]);
+      } else if (av[0].t == V_ARR) {
+        int64_t len = na > 1 ? asInt(av[1]) : (int64_t)av[0].a->v.size();
+        for (int64_t k = 0; k < len && k < (int64_t)av[0].a->v.size(); k++) bytes.push_back((int)(asInt(av[0].a->v[(size_t)k]) & 0xFF));
+      } else if (av[0].isNum()) {
+        bytes.push_back((int)(asInt(av[0]) & 0xFF));
+      } else {
+        fail(line, "Wire.write() necesita un numero, un texto o un array");
+        return Value();
+      }
+      for (size_t k = 0; k < bytes.size(); k++) {
+        args[1] = bytes[k];
+        hal.nativeError.clear();
+        count += (int64_t)hal.native(NF_WIRE_WRITE, args, 2);
+        if (!hal.nativeError.empty()) { fail(line, "Wire.write(): %s", hal.nativeError.c_str()); return Value(); }
+      }
+      return Value::I(count);
+    }
+    case XS_SPI_TRANSFER: {
+      double arg[1];
+      if (av[0].t == V_ARR) {
+        ArrObj* arr = av[0].a;
+        int64_t len = na > 1 ? asInt(av[1]) : (int64_t)arr->v.size();
+        for (int64_t k = 0; k < len && k < (int64_t)arr->v.size(); k++) {
+          arg[0] = (double)(asInt(arr->v[(size_t)k]) & 0xFF);
+          hal.nativeError.clear();
+          double r = hal.native(NF_SPI_TRANSFER, arg, 1);
+          if (!hal.nativeError.empty()) { fail(line, "SPI.transfer(): %s", hal.nativeError.c_str()); return Value(); }
+          arr->v[(size_t)k] = coerce(Value::I((int64_t)r), arr->elemTy, line);
+        }
+        return Value();
+      }
+      if (!av[0].isNum()) { fail(line, "SPI.transfer() necesita un numero o un array"); return Value(); }
+      arg[0] = (double)(asInt(av[0]) & 0xFF);
+      hal.nativeError.clear();
+      double r = hal.native(NF_SPI_TRANSFER, arg, 1);
+      if (!hal.nativeError.empty()) { fail(line, "SPI.transfer(): %s", hal.nativeError.c_str()); return Value(); }
+      return Value::I((int64_t)r);
+    }
+    case XS_ATTACH_INT: case XS_TIMER_ATTACH: {
+      if (av[1].t != V_FUNC) {
+        fail(line, "%s(): el segundo argumento debe ser el nombre de una funcion", d.name);
+        return Value();
+      }
+      int fi = (int)av[1].i;
+      if (!funcs[fi].params.empty()) {
+        fail(line, "la funcion '%s' de la interrupcion no puede tener parametros", funcs[fi].name.c_str());
+        return Value();
+      }
+      if (!av[0].isNum()) { fail(line, "%s(): el primer argumento debe ser un numero", d.name); return Value(); }
+      double args[2];
+      args[0] = num(av[0]);
+      int nfn;
+      int cnt;
+      if (d.nf == XS_ATTACH_INT) {
+        const char* pe = hal.pinError((int)args[0], false);
+        if (pe) { fail(line, "%s", pe); return Value(); }
+        if (!av[2].isNum()) { fail(line, "attachInterrupt(): el modo debe ser RISING, FALLING o CHANGE"); return Value(); }
+        args[1] = num(av[2]);
+        nfn = NF_PIN_EVENT_ATTACH;
+        cnt = 2;
+      } else {
+        nfn = NF_TIMER_ATTACH;
+        cnt = 1;
+      }
+      hal.nativeError.clear();
+      int slot = (int)hal.native(nfn, args, cnt);
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      if (slot >= 0 && slot < 32) eventFunc[slot] = fi;
+      return Value();
+    }
+    case XS_DETACH_INT: case XS_TIMER_DETACH: {
+      if (!av[0].isNum()) { fail(line, "%s() necesita un numero", d.name); return Value(); }
+      double args[1] = {num(av[0])};
+      hal.nativeError.clear();
+      int slot = (int)hal.native(d.nf == XS_DETACH_INT ? NF_PIN_EVENT_DETACH : NF_TIMER_DETACH, args, 1);
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      if (slot >= 0 && slot < 32) eventFunc[slot] = -1;
+      return Value();
+    }
+    case XS_TIMER_BEGIN: {
+      for (int k = 0; k < na; k++)
+        if (!av[k].isNum()) { fail(line, "timerBegin() necesita numeros"); return Value(); }
+      double freq;
+      if (na == 1) freq = num(av[0]);                      // core 3.x: timerBegin(frecuencia)
+      else if (na == 3 && num(av[1]) > 0) freq = 80000000.0 / num(av[1]);  // 2.x: timerBegin(n, divisor, subir)
+      else { fail(line, "usa timerBegin(frecuencia) o timerBegin(numero, divisor, true)"); return Value(); }
+      double args[1] = {freq};
+      hal.nativeError.clear();
+      double h = hal.native(NF_TIMER_BEGIN, args, 1);
+      if (!hal.nativeError.empty()) { fail(line, "timerBegin(): %s", hal.nativeError.c_str()); return Value(); }
+      return Value::I((int64_t)h);
+    }
+    case XS_FREQ_READ: {
+      if (!av[0].isNum() || (na > 1 && !av[1].isNum())) { fail(line, "%s() necesita numeros", d.name); return Value(); }
+      int pin = (int)asInt(av[0]);
+      int64_t gate = na > 1 ? asInt(av[1]) : 1000;
+      if (gate < 10) gate = 10;
+      const char* pe = hal.pinError(pin, false);
+      if (pe) { fail(line, "%s", pe); return Value(); }
+      double args[2] = {(double)pin, 1.0};
+      hal.nativeError.clear();
+      bool started = hal.native(NF_CNT_START, args, 2) != 0;
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      double c0 = hal.native(NF_CNT_READ, args, 1);
+      uint32_t t0 = hal.micros();
+      if (!sleepMs((uint32_t)gate)) return Value();
+      double c1 = hal.native(NF_CNT_READ, args, 1);
+      uint32_t t1 = hal.micros();
+      if (started) hal.native(NF_CNT_STOP, args, 1);
+      double us = (double)(uint32_t)(t1 - t0);
+      return Value::F(us > 0 ? (c1 - c0) * 1e6 / us : 0.0);
+    }
+    default:
+      break;
+  }
+  // llamada nativa normal: argumentos numericos
+  double args[MAX_ARGS + 2];
+  int k = 0;
+  if (d.flags & XF_BUS) args[k++] = n->op;
+  Value* self = nullptr;
+  if (d.flags & XF_SELF) {
+    uint8_t ty;
+    self = lref(first, ty);
+    if (!self) return Value();
+    int64_t h = self->t == V_INT ? self->i : 0;
+    if (h == 0 && d.nf != NF_SERVO_ATTACH && d.nf != NF_SERVO_ATTACHED) {
+      fail(line, "el servo no esta conectado: usa primero .attach(pin)");
+      return Value();
+    }
+    args[k++] = (double)h;
+  }
+  for (int q = 0; q < na; q++) {
+    if (!av[q].isNum()) {
+      fail(line, "el argumento %d de %s() debe ser un numero pero es %s", q + 1, d.name, kindName(av[q]));
+      return Value();
+    }
+    args[k++] = num(av[q]);
+  }
+  if (d.pinArg >= 0 && d.pinArg < na) {
+    const char* pe = hal.pinError((int)asInt(av[d.pinArg]), d.pinOut);
+    if (pe) { fail(line, "%s", pe); return Value(); }
+  }
+  hal.nativeError.clear();
+  double r = hal.native(d.nf, args, k);
+  if (!hal.nativeError.empty()) {
+    fail(line, "%s(): %s", d.name, hal.nativeError.c_str());
+    return Value();
+  }
+  if (d.nf == NF_SERVO_ATTACH && self) *self = Value::I((int64_t)r);
+  switch (d.ret) {
+    case 'b': return Value::I(r != 0);
+    case 'i': return Value::I((int64_t)r);
+    case 'f': return Value::F(r);
+    default: return Value();
+  }
+}
+
 static std::string& mutStr(Value* v) {
   if (v->s->rc > 1) {
     StrObj* c = new StrObj;
@@ -3445,6 +3974,10 @@ RunResult Interpreter::start() {
   m.stack.clear();
   m.stack.resize(STACK_SLOTS);
   m.sp = 0; m.fp = 0; m.depth = 0;
+  for (int k = 0; k < 32; k++) m.eventFunc[k] = -1;
+  m.eventMask = 0;
+  m.inEvent = false;
+  hal.takeEvents();
   for (size_t k = 0; k < m.globalInits.size(); k++) {
     m.execDecl(m.globalInits[k]);
     if (m.abort_) {

@@ -59,7 +59,7 @@ Chips compatibles: ESP32, ESP32‑S3, ESP32‑C3 y ESP32‑C6. El **ESP32‑S2 n
 
 ### Opción B · Con el Arduino IDE
 
-1. En *Herramientas → Placa → Gestor de placas*, instala **esp32** de Espressif **versión 3.3.x**. La 4.0, aún en pruebas, cambió la librería Bluetooth y el firmware te avisará si la tienes.
+1. En *Herramientas → Placa → Gestor de placas*, instala **esp32** de Espressif **versión 3.3.x** (hace falta la 3.x; la 4.0, aún en pruebas, cambió la librería Bluetooth). El firmware te avisa si tienes otra.
 2. Abre `esp32/XRTboxESP32/XRTboxESP32.ino`, elige tu placa y en *Partition Scheme* pon **Huge APP (3MB No OTA/1MB SPIFFS)**. En S3/C3/C6 activa también *USB CDC On Boot → Enabled* si vas a usar el cable del USB nativo.
 3. Pulsa **Subir**. En el Monitor Serie (115200) verás `[X-RTbox] Bluetooth listo: X-RTbox-A1B2`.
 
@@ -70,7 +70,7 @@ Chips compatibles: ESP32, ESP32‑S3, ESP32‑C3 y ESP32‑C6. El **ESP32‑S2 n
 1. **ENLAZAR ESP32**, en *Conectar por*:
    - **BLUETOOTH**: busca y toca tu `X-RTbox-XXXX`. La próxima vez se reconecta sola al abrir la app.
    - **USB‑C**: con el ESP32 enchufado al móvil. Al enchufarlo, Android ya te ofrece abrir la app y enlazar.
-2. **CREAR PROGRAMA** → ponle nombre → *PEGAR* tu código (o *PLANTILLA* para un ejemplo) → *GUARDAR*, o *GUARDAR Y CARGAR* para mandarlo ya.
+2. **CREAR PROGRAMA** → ponle nombre → *PEGAR* tu código (o *EJEMPLOS* para elegir uno de los que trae la app) → *GUARDAR*, o *GUARDAR Y CARGAR* para mandarlo ya.
 3. **ALMACÉN** → **toca un programa y se carga al instante**. Mantén pulsado para editar, renombrar, compartir o eliminar. *IMPORTAR* trae archivos `.ino`/`.cpp`.
    - **Consola:** muestra lo que imprime tu programa con `Serial.print`. Con *ENVIAR* le mandas texto, que lee con `Serial.readStringUntil('\n')`, `Serial.read()`, etc.
    - **■ DETENER** para el programa y deja los pines en reposo. **▶ REINICIAR** lo vuelve a ejecutar desde `setup()`.
@@ -99,9 +99,36 @@ El ESP32 **recuerda el último programa** y lo ejecuta solo al encenderse. Si un
 - `Serial`: `begin`, `print`, `println` (con `HEX`, `BIN`, decimales), `printf`, `write`, `available`, `read`, `peek`, `readString`, `readStringUntil`, `parseInt`, `parseFloat`
 - `String`: `+`, `+=`, `==`, `length`, `substring`, `indexOf`, `charAt`, `toInt`, `toFloat`, `trim`, `toUpperCase`, `toLowerCase`, `replace`, `startsWith`, `endsWith`, `equals`, `remove`, `setCharAt`…, `String(valor)`, `String(valor, HEX)`, `F("texto")`
 
-**No (de momento):** librerías externas (`Servo.h`, `WiFi.h`, `Wire`/I2C, SPI…), `class`/`struct`, plantillas, punteros, `attachInterrupt`, `sprintf`/`strcpy`. La app avisa con un error claro y la línea.
+- `#include <Wire.h>`, `<SPI.h>`, `<ESP32Servo.h>`… se aceptan; estas librerías del ESP32 vienen ya dentro del firmware.
 
-**Velocidad y tamaño:** al ser interpretado va bastante más lento que compilado (del orden de cientos de miles de instrucciones por segundo), de sobra para LEDs, botones, sensores, PWM, etc. Admite programas de hasta 32 KB. Los pines de la memoria flash (6‑11 en el ESP32 clásico) están protegidos.
+### Librerías y funciones del ESP32
+
+| Para qué | Funciones |
+|---|---|
+| **PWM (LEDC)**, API del core 3.x | `ledcAttach(pin, Hz, bits)`, `ledcAttachChannel`, `ledcWrite(pin, duty)`, `ledcWriteTone`, `ledcWriteNote`, `ledcRead`, `ledcReadFreq`, `ledcChangeFrequency`, `ledcFade`, `ledcDetach` |
+| PWM, API antigua 2.x (canales) | `ledcSetup(canal, Hz, bits)`, `ledcAttachPin(pin, canal)`, `ledcWrite(canal, duty)`, `ledcDetachPin` |
+| `analogWrite` | `analogWriteFrequency([pin,] Hz)`, `analogWriteResolution([pin,] bits)` |
+| **Generadores de señal** | `signalSquare(pin, Hz, %)` cuadrada por hardware (1 Hz – 40 MHz, en cualquier pin de salida) · `signalSine(pin, Hz, amplitudV, nivelMedioV)` senoidal · `signalTriangle(...)` · `signalSawtooth(...)` (hasta 10 kHz) · `signalStop(pin)`. En español: `cuadrada`, `senoidal`, `triangular`, `dienteDeSierra`, `pararSenal` |
+| **Medir** | `frequencyRead(pin, ms)` / `medirFrecuencia` (Hz, hasta unos 100 kHz), `pulseCounterStart/Read/Reset/Stop(pin)`, `pulseIn`, `pulseInLong` |
+| **Interrupciones** | `attachInterrupt(digitalPinToInterrupt(pin), funcion, RISING/FALLING/CHANGE)`, `detachInterrupt`, `noInterrupts()`/`interrupts()`, `portENTER_CRITICAL(&mux)`/`portEXIT_CRITICAL`, `IRAM_ATTR`, `volatile` |
+| **Temporizadores** | 3.x: `timerBegin(Hz)`, `timerAttachInterrupt(t, &f)`, `timerAlarm(t, valor, repetir, 0)` · 2.x: `timerBegin(0, 80, true)`, `timerAlarmWrite`, `timerAlarmEnable/Disable` · y `timerStart/Stop/Restart/End`, `timerRead`, `timerReadMicros/Millis/Seconds`, `timerWrite` |
+| **I2C** | `Wire` y `Wire1`: `begin([SDA, SCL[, Hz]])`, `setClock`, `beginTransmission`, `write`, `endTransmission`, `requestFrom`, `available`, `read`, `peek`, `end` |
+| **SPI** | `SPI.begin([sck, miso, mosi, ss])`, `beginTransaction(SPISettings(Hz, MSBFIRST, SPI_MODE0))`, `transfer` (byte o array), `transfer16/32`, `write`, `endTransaction`, `setFrequency`, `setDataMode`, `setBitOrder` |
+| **Servos** | `Servo s; s.attach(pin[, minUs, maxUs])`, `write(grados)`, `writeMicroseconds`, `read`, `attached`, `detach` (también en arrays: `Servo dedos[5];`) |
+| ADC | `analogReadMilliVolts`, `analogSetAttenuation(ADC_11db)`, `analogSetPinAttenuation`, `A0`…`A19` |
+| Sistema | `ESP.getChipModel()`, `getFreeHeap`, `getHeapSize`, `getCpuFreqMHz`, `getChipCores`, `getFlashChipSize`, `getEfuseMac`, `getSdkVersion`, `ESP.restart()`, `temperatureRead()`, `setCpuFrequencyMhz`, `esp_random()`, `esp_timer_get_time()`, `rgbLedWrite(pin, r, g, b)` |
+| Constantes | `SDA`, `SCL`, `MOSI`, `MISO`, `SCK`, `SS`, `TX`, `RX`, `DAC1`, `DAC2`, `LED_BUILTIN`, `RGB_BUILTIN`, `NOTE_C`…`NOTE_B` |
+
+### Señales de 1 kHz (y otras)
+
+- **Cuadrada exacta:** `signalSquare(18, 1000);` → 1000 Hz al 50 % en el pin 18. La genera el periférico LEDC, así que es estable aunque tu programa esté haciendo otras cosas. Con ciclo de trabajo: `signalSquare(18, 1000, 25);`. Lo mismo con la API de siempre: `ledcAttach(18, 1000, 10); ledcWrite(18, 512);`.
+- **Senoidal / triangular / diente de sierra:** `signalSine(25, 1000);` (por defecto de 0 a 3,3 V) o `signalSine(25, 1000, 1.0, 1.65);` (1 V de pico alrededor de 1,65 V). En el ESP32 clásico los pines **25 y 26** tienen DAC y la señal sale directamente (40 000 muestras/s, 40 puntos por periodo a 1 kHz). En cualquier otro pin, o en ESP32‑S3/C3/C6 (que no tienen DAC), sale por el modulador **sigma‑delta**: pon un filtro RC (1 kΩ en serie y 47 nF a GND) y verás la onda limpia.
+- **Comprobarla sin osciloscopio:** une el pin de salida con otro pin y usa `frequencyRead(4, 1000)` (ejemplo *Senal1kHz*).
+- **Interrupciones de temporizador a 1 kHz:** funcionan (ejemplo *TimerInterrupcion*), pero ten en cuenta que en X‑RTbox la función de la interrupción la ejecuta el intérprete justo después de la instrucción en curso: no se pierde ninguna (si llegan varias seguidas se ejecuta una vez por cada una), pero puede retrasarse algunos microsegundos. **Para sacar una señal precisa usa `signalSquare`/`ledc`, no un `digitalWrite` dentro de la interrupción.**
+
+**No (de momento):** `WiFi.h`, `class`/`struct`, plantillas, punteros (`&x` fuera de los usos de arriba), `sprintf`/`strcpy`, modo esclavo I2C. La app avisa con un error claro y la línea.
+
+**Velocidad y tamaño:** al ser interpretado va bastante más lento que compilado (del orden de cientos de miles de instrucciones por segundo), de sobra para LEDs, botones, sensores, etc. Las señales (PWM, generadores, temporizadores) las saca el hardware del ESP32, así que no dependen de esa velocidad. Admite programas de hasta 32 KB. Los pines de la memoria flash (6‑11 en el ESP32 clásico) están protegidos.
 
 ---
 

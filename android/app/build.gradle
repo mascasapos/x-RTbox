@@ -33,3 +33,14 @@ android {
         checkReleaseBuilds false
     }
 }
+
+// Los ejemplos de la carpeta ejemplos/ del repositorio van dentro de la app
+def ejemplosGenerados = new File(buildDir, 'generated/ejemplos')
+android.sourceSets.main.assets.srcDir(ejemplosGenerados)
+tasks.register('copiarEjemplos', Copy) {
+    from(new File(rootDir, '../ejemplos')) {
+        include '*.cpp'
+    }
+    into new File(ejemplosGenerados, 'ejemplos')
+}
+preBuild.dependsOn('copiarEjemplos')
