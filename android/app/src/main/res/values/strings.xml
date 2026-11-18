@@ -28,7 +28,7 @@
     <string name="scan">BLUETOOTH</string>
     <string name="usb">USB-C</string>
     <string name="connect_via">CONECTAR POR</string>
-    <string name="flash">⚡ INSTALAR FIRMWARE BLUETOOTH</string>
+    <string name="flash">⚡ INSTALAR / ACTUALIZAR FIRMWARE</string>
     <string name="flash_hint">Con el ESP32 conectado al USB-C del móvil, le graba el firmware X-RTbox (Bluetooth + USB). Solo hace falta una vez, sin PC.</string>
     <string name="disconnect">DESCONECTAR</string>
     <string name="devices_found">DISPOSITIVOS ENCONTRADOS</string>

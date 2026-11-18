@@ -97,6 +97,9 @@ public class EspLink {
 
         /** Fin de la instalacion del firmware por USB. */
         void onFlashFinished(boolean ok, String message);
+
+        /** El ESP32 tiene un firmware distinto del que trae la app ("" = antiguo, sin version). */
+        void onFirmwareOutdated(String remoteVersion);
     }
 
     public interface UsbPermissionCallback {
@@ -151,6 +154,9 @@ public class EspLink {
     // estado del ESP32
     private String remoteState = "NONE";
     private String remoteProgram = "";
+    private String remoteFw = null;       // version del firmware del ESP32 (null = aun no se sabe)
+    private boolean fwWarned = false;
+    private String bundledFw = null;
     private int remoteHeap = 0;
 
     // envio de programas
@@ -507,6 +513,8 @@ public class EspLink {
         link = LINK_CONNECTING;
         remoteState = "NONE";
         remoteProgram = "";
+        remoteFw = null;
+        fwWarned = false;
         main.removeCallbacks(connectTimeout);
         main.postDelayed(connectTimeout, 15000);
         if (!silent) appendLine("» Conectando con " + deviceName + "...", KIND_SYS);
@@ -576,6 +584,8 @@ public class EspLink {
         main.removeCallbacks(commandTimeout);
         remoteState = "NONE";
         remoteProgram = "";
+        remoteFw = null;
+        fwWarned = false;
     }
 
     private final BluetoothGattCallback gattCb = new BluetoothGattCallback() {
@@ -1081,6 +1091,8 @@ public class EspLink {
         silentConnect = false;
         remoteState = "NONE";
         remoteProgram = "";
+        remoteFw = null;
+        fwWarned = false;
         appendLine("» Conectando por USB-C (" + deviceName + ")...", KIND_SYS);
         computeBusy();
         notifyLink();
@@ -1189,12 +1201,44 @@ public class EspLink {
             main.removeCallbacks(commandTimeout);
             remoteState = "NONE";
             remoteProgram = "";
+            remoteFw = null;
+            fwWarned = false;
         }
     }
 
     // ------------------------------------------------------------------
     //  Instalar el firmware X-RTbox por USB
     // ------------------------------------------------------------------
+    /** Version del firmware que trae la app (assets/firmware/version.txt), o "" si no la tiene. */
+    public String getBundledFirmwareVersion() {
+        if (bundledFw != null) return bundledFw;
+        bundledFw = "";
+        try (InputStream in = ctx.getAssets().open("firmware/version.txt")) {
+            byte[] b = new byte[64];
+            int n = in.read(b);
+            if (n > 0) bundledFw = new String(b, 0, n, StandardCharsets.UTF_8).trim();
+        } catch (IOException e) {
+            // app compilada sin version
+        }
+        return bundledFw;
+    }
+
+    /** Version del firmware del ESP32 enlazado: null si aun no se sabe, "" si es antiguo (no la envia). */
+    public String getRemoteFirmwareVersion() {
+        return remoteFw;
+    }
+
+    /** true si el ESP32 enlazado tiene un firmware distinto del que trae la app. */
+    public boolean isFirmwareOutdated() {
+        String b = getBundledFirmwareVersion();
+        return link == LINK_READY && remoteFw != null && !b.isEmpty() && !b.equals(remoteFw);
+    }
+
+    /** El ESP32 enlazado por USB (o null). */
+    public UsbDevice getConnectedUsbDevice() {
+        return transport == TRANSPORT_USB ? usbDevice : null;
+    }
+
     /** Firmwares incluidos en la app (assets/firmware/*.bin). */
     public List<String> bundledFirmwares() {
         List<String> out = new ArrayList<>();
@@ -1323,6 +1367,7 @@ public class EspLink {
                 } catch (NumberFormatException e) {
                     remoteHeap = 0;
                 }
+                remoteFw = p.length > 3 ? p[3].trim() : "";
                 if (commandPending) {
                     commandPending = false;
                     main.removeCallbacks(commandTimeout);
@@ -1334,6 +1379,16 @@ public class EspLink {
                     } else if ("ERR".equals(remoteState)) {
                         finishSending(false, lastError != null ? lastError : "Error al cargar el programa");
                     }
+                }
+                if (!fwWarned && isFirmwareOutdated()) {
+                    fwWarned = true;
+                    final String rv = remoteFw;
+                    main.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            for (Listener l : new ArrayList<>(listeners)) l.onFirmwareOutdated(rv);
+                        }
+                    });
                 }
                 computeBusy();
                 notifyLink();

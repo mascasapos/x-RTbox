@@ -46,6 +46,14 @@
 #include <Wire.h>
 #include <SPI.h>
 #include "MiniC.h"
+// Version del firmware: la escribe GitHub al compilar (huella del codigo fuente).
+// La app la compara con la del firmware que lleva dentro y avisa si el ESP32 tiene uno antiguo.
+#if __has_include("xrtbox_version.h")
+#include "xrtbox_version.h"
+#endif
+#ifndef XRTBOX_FW_VERSION
+#define XRTBOX_FW_VERSION "dev"
+#endif
 
 // Las funciones de PWM, temporizadores, etc. son las del core 3.x.
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
@@ -236,7 +244,7 @@ static void sendState() {
   char n[48];
   getProgName(n, sizeof n);
   int st = progState.load();
-  sendCtl('T', "%s|%s|%u", names[st < 0 || st > 4 ? 0 : st], n, (unsigned)ESP.getFreeHeap());
+  sendCtl('T', "%s|%s|%u|%s", names[st < 0 || st > 4 ? 0 : st], n, (unsigned)ESP.getFreeHeap(), XRTBOX_FW_VERSION);
 }
 
 // ---------------------------------------------------------------------
@@ -392,7 +400,7 @@ class EspHal : public minic::Hal {
   uint64_t outPins = 0, pwmPins = 0, tonePins = 0, rgbPins = 0;
   bool rgbUsed = false;
   uint32_t lastYield = 0;
-  char perr[80];
+  char perr[120];
   char nerr[160];
 
   // estado de las librerias
@@ -444,7 +452,7 @@ class EspHal : public minic::Hal {
 #endif
     if (!valid) { snprintf(perr, sizeof perr, "el pin %d no existe en este ESP32", pin); return perr; }
 #if CONFIG_IDF_TARGET_ESP32
-    if (pin >= 6 && pin <= 11) { snprintf(perr, sizeof perr, "el pin %d esta reservado para la memoria flash", pin); return perr; }
+    if (pin >= 6 && pin <= 11) { snprintf(perr, sizeof perr, "el pin %d es de la memoria flash (los 6 a 11 no se pueden usar); prueba 25, 26, 27, 32 o 33", pin); return perr; }
     if (output && pin >= 34) { snprintf(perr, sizeof perr, "el pin %d solo puede usarse como entrada", pin); return perr; }
 #elif CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32S2
     if (pin >= 26 && pin <= 32) { snprintf(perr, sizeof perr, "el pin %d esta reservado para la memoria flash/PSRAM", pin); return perr; }
@@ -2029,6 +2037,7 @@ void setup() {
 
   Serial.println();
   Serial.println("[X-RTbox] ==== X-RTbox ESP32 ====");
+  Serial.printf("[X-RTbox] Firmware %s\n", XRTBOX_FW_VERSION);
   if (!LittleFS.begin(true)) Serial.println("[X-RTbox] Aviso: no se pudo montar LittleFS (no se guardaran programas)");
 
   ctlQueue = xQueueCreate(12, sizeof(CtlMsg));

@@ -765,7 +765,13 @@ public class MainActivity extends Activity implements EspLink.Listener {
             linkState.setText(usbLink ? "● Enlazado por USB-C (" + ble.getDeviceName() + ")"
                     : "● Enlazado con " + ble.getDeviceName() + " (Bluetooth)");
             linkState.setTextColor(0xFFE2B3FF);
-            linkDetail.setText(remoteSummary() + (ble.getRemoteHeap() > 0 ? "  ·  " + (ble.getRemoteHeap() / 1024) + " KB libres" : ""));
+            String fwLine = "";
+            if (!ble.getBundledFirmwareVersion().isEmpty() && ble.getRemoteFirmwareVersion() != null) {
+                fwLine = ble.isFirmwareOutdated()
+                        ? "\n⚠ Firmware del ESP32 antiguo: pulsa ⚡ INSTALAR FIRMWARE"
+                        : "\nFirmware del ESP32 al día (" + ble.getRemoteFirmwareVersion() + ")";
+            }
+            linkDetail.setText(remoteSummary() + (ble.getRemoteHeap() > 0 ? "  ·  " + (ble.getRemoteHeap() / 1024) + " KB libres" : "") + fwLine);
         } else if (st == EspLink.LINK_CONNECTING) {
             linkState.setText(usbLink ? "◌ Conectando por USB-C..." : "◌ Conectando con " + ble.getDeviceName() + "...");
             linkState.setTextColor(0xFFFFFFFF);
@@ -960,10 +966,20 @@ public class MainActivity extends Activity implements EspLink.Listener {
             return;
         }
         final int line = errorLine(message);
+        final boolean oldFw = ble.isFirmwareOutdated();
+        if (oldFw) message += "\n\n⚠ El ESP32 tiene un firmware X-RTbox antiguo: muchos errores como este desaparecen al actualizarlo.";
         AlertDialog.Builder b = dialog()
                 .setTitle(programName == null || programName.isEmpty() ? "Error" : "Error en \"" + programName + "\"")
                 .setMessage(message)
                 .setPositiveButton("OK", null);
+        if (oldFw) {
+            b.setNegativeButton("ACTUALIZAR FIRMWARE", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int w) {
+                    offerFirmwareUpdate(ble.getRemoteFirmwareVersion());
+                }
+            });
+        }
         if (line > 0 && programName != null && store.exists(programName)) {
             b.setNeutralButton("IR A LA LÍNEA " + line, new DialogInterface.OnClickListener() {
                 @Override
@@ -971,6 +987,40 @@ public class MainActivity extends Activity implements EspLink.Listener {
                     editProgram(programName, line);
                 }
             });
+        }
+        b.show();
+    }
+
+    @Override
+    public void onFirmwareOutdated(String remoteVersion) {
+        if (isFinishing() || isDestroyed() || ble.isFlashing()) return;
+        offerFirmwareUpdate(remoteVersion);
+    }
+
+    private void offerFirmwareUpdate(String remote) {
+        String bundled = ble.getBundledFirmwareVersion();
+        String what;
+        if (remote == null || remote.isEmpty()) what = "un firmware X-RTbox antiguo";
+        else if ("dev".equals(remote)) what = "un firmware X-RTbox compilado a mano";
+        else what = "otra versión del firmware X-RTbox (" + remote + ")";
+        String msg = "El ESP32 tiene " + what + " y esta app trae la versión " + bundled + ".\n\n"
+                + "Con un firmware antiguo, los programas que usan funciones nuevas (ledc_..., struct, signalSquare, Servo, Wire...) "
+                + "dan error de compilación aunque estén bien escritos.";
+        final UsbDevice dev = ble.getConnectedUsbDevice();
+        AlertDialog.Builder b = dialog().setTitle("⚠ Actualiza el firmware del ESP32");
+        if (dev != null) {
+            b.setMessage(msg + "\n\nPulsa INSTALAR AHORA: tarda menos de dos minutos y no hay que desconectar nada. "
+                    + "Se borra el programa que tenga cargado el ESP32; los de tu almacén no se tocan.")
+                    .setPositiveButton("INSTALAR AHORA", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int w) {
+                            ble.flashFirmware(dev);
+                        }
+                    })
+                    .setNegativeButton("MÁS TARDE", null);
+        } else {
+            b.setMessage(msg + "\n\nConecta el ESP32 al móvil con un cable USB-C y pulsa ENLAZAR ESP32 → ⚡ INSTALAR FIRMWARE.")
+                    .setPositiveButton("OK", null);
         }
         b.show();
     }

@@ -16,6 +16,14 @@ echo "core=$VER" >> "$GITHUB_OUTPUT"
 arduino-cli core install "esp32:esp32@$VER" --additional-urls "$URL" || exit 1
 python3 -m pip install --quiet --break-system-packages esptool 2>/dev/null || python3 -m pip install --quiet --user esptool || true
 
+# Version del firmware = huella del codigo fuente (la app la compara con la del ESP32)
+SRC=esp32/XRTboxESP32
+rm -f "$SRC/xrtbox_version.h"
+FWV=$(cat "$SRC"/*.ino "$SRC"/*.cpp "$SRC"/*.h | sha1sum | cut -c1-8)
+echo "#define XRTBOX_FW_VERSION \"$FWV\"" > "$SRC/xrtbox_version.h"
+printf '%s' "$FWV" > "$ASSETS/version.txt"
+echo "Version del firmware: $FWV"
+
 build() {  # $1 nombre, $2 fqbn, $3 direccion del bootloader
   local name="$1" fqbn="$2" boot="$3" dir="build/$1"
   echo "::group::Firmware $name"
