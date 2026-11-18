@@ -1,0 +1,72 @@
+# Compila el firmware del ESP32 y la app Android en los servidores de GitHub
+# y publica el APK con un enlace de descarga directa:
+#   https://github.com/<tu-usuario>/<tu-repositorio>/releases/latest/download/X-RTbox.apk
+name: Compilar X-RTbox
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compilar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Compilar el firmware del ESP32 (ESP32, S3, C3, C6)
+        id: firmware
+        continue-on-error: true
+        run: bash herramientas/compilar-firmware.sh
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Compilar el APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Preparar archivos
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk X-RTbox.apk
+
+      - name: Guardar como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: X-RTbox
+          path: |
+            X-RTbox.apk
+            firmware-out/*.bin
+
+      - name: Publicar la descarga directa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(X-RTbox.apk firmware-out/*.bin)
+          gh release delete apk --yes --cleanup-tag || true
+          gh release create apk "${files[@]}" \
+            --target "${{ github.sha }}" \
+            --title "X-RTbox (ultima version)" \
+            --latest \
+            --notes "Abre este enlace en el movil para descargar e instalar la app: https://github.com/${{ github.repository }}/releases/latest/download/X-RTbox.apk  -  Core ESP32: ${{ steps.firmware.outputs.core }}"
+          {
+            echo "## X-RTbox compilado"
+            echo ""
+            echo "**Descarga directa del APK:** https://github.com/${{ github.repository }}/releases/latest/download/X-RTbox.apk"
+            echo ""
+            echo "Firmwares incluidos en la app: $(ls android/app/src/main/assets/firmware/*.bin 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
+          } >> "$GITHUB_STEP_SUMMARY"

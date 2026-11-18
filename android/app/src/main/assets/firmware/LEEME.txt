@@ -1,0 +1,5 @@
+Aqui van los firmwares X-RTbox que la app puede instalar por USB-C:
+  esp32.bin, esp32s3.bin, esp32c3.bin, esp32c6.bin
+(imagen completa, se graba desde la direccion 0x0).
+La compilacion de GitHub (.github/workflows/compilar.yml y herramientas/compilar-firmware.sh) los genera y los
+copia aqui automaticamente antes de compilar el APK.

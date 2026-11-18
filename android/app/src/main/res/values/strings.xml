@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">X-RTbox</string>
+    <string name="app_title">X-RTbox</string>
+    <string name="menu_create">CREAR PROGRAMA</string>
+    <string name="menu_store">ALMACÉN</string>
+    <string name="menu_link">ENLAZAR ESP32</string>
+    <string name="home_hint">Crea un programa pegando tu código, enlaza el ESP32 por Bluetooth o USB-C y toca el programa en el almacén para cargarlo al instante.</string>
+    <string name="title_create">CREAR PROGRAMA</string>
+    <string name="title_store">ALMACÉN</string>
+    <string name="title_link">ENLAZAR ESP32</string>
+    <string name="hint_name">Nombre del programa</string>
+    <string name="hint_code">// Pega aquí tu código C++ de Arduino\n// (setup, loop, pinMode, digitalWrite, delay...)</string>
+    <string name="paste">PEGAR</string>
+    <string name="template">PLANTILLA</string>
+    <string name="clear">BORRAR</string>
+    <string name="save">GUARDAR</string>
+    <string name="save_load">GUARDAR Y CARGAR</string>
+    <string name="import_file">IMPORTAR</string>
+    <string name="store_hint">Toca un programa para cargarlo en el ESP32 · mantén pulsado para más opciones</string>
+    <string name="store_empty">Aún no hay programas.\nCréalos en CREAR PROGRAMA o impórtalos desde un archivo .ino / .cpp.</string>
+    <string name="run">▶ REINICIAR</string>
+    <string name="stop">■ DETENER</string>
+    <string name="console">CONSOLA</string>
+    <string name="console_clear">LIMPIAR</string>
+    <string name="console_hint">Enviar texto al Serial del ESP32</string>
+    <string name="send">ENVIAR</string>
+    <string name="scan">BLUETOOTH</string>
+    <string name="usb">USB-C</string>
+    <string name="connect_via">CONECTAR POR</string>
+    <string name="flash">⚡ INSTALAR FIRMWARE BLUETOOTH</string>
+    <string name="flash_hint">Con el ESP32 conectado al USB-C del móvil, le graba el firmware X-RTbox (Bluetooth + USB). Solo hace falta una vez, sin PC.</string>
+    <string name="disconnect">DESCONECTAR</string>
+    <string name="devices_found">DISPOSITIVOS ENCONTRADOS</string>
+    <string name="back">‹</string>
+</resources>
