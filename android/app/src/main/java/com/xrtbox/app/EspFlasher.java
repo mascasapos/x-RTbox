@@ -3,7 +3,9 @@ package com.xrtbox.app;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 /**
  * Graba el firmware en el ESP32 por USB usando el cargador de su ROM
@@ -121,6 +123,7 @@ public class EspFlasher {
             throw new FlashException("Esta versión de la app no incluye el firmware para " + chip.name
                     + ". Usa el APK compilado por GitHub (incluye los firmwares).");
         }
+        image = trimTrailingFF(image);
         if (fast && !io.isNativeUsb()) changeBaud(FAST_BAUD);
         check("preparar la memoria", CMD_SPI_ATTACH, new byte[8], 0, 3000);
         ByteArrayOutputStream p = new ByteArrayOutputStream();
@@ -246,6 +249,16 @@ public class EspFlasher {
     // ------------------------------------------------------------------
     //  Escritura comprimida
     // ------------------------------------------------------------------
+    /** Quita el relleno vacio (0xFF) del final: no hace falta borrarlo ni escribirlo. */
+    static byte[] trimTrailingFF(byte[] img) {
+        int end = img.length;
+        while (end > 0 && img[end - 1] == (byte) 0xFF) end--;
+        end = ((end + 4095) / 4096) * 4096;
+        if (end <= 0) end = Math.min(img.length, 4096);
+        if (end >= img.length) return img;
+        return Arrays.copyOf(img, end);
+    }
+
     static byte[] deflate(byte[] in) {
         Deflater d = new Deflater(Deflater.BEST_COMPRESSION);
         d.setInput(in);
@@ -274,9 +287,25 @@ public class EspFlasher {
         report("Borrando la memoria del " + chip.name + "...", 4);
         int eraseTimeout = (int) Math.max(15000, 35L * eraseSize / 1000);   // ~35 s por MB
         check("borrar la memoria", CMD_DEFL_BEGIN, p.toByteArray(), 0, eraseTimeout);
+        // Para cada bloque se calcula cuanto ocupa descomprimido (como esptool):
+        // un bloque de relleno puede ser mucho mayor y la ROM tarda mas en escribirlo.
+        Inflater meter = new Inflater();
+        byte[] scratch = new byte[65536];
         for (int seq = 0; seq < blocks; seq++) {
             int off = seq * BLOCK;
             int n = Math.min(BLOCK, comp.length - off);
+            long produced = 0;
+            meter.setInput(comp, off, n);
+            try {
+                while (!meter.needsInput() && !meter.finished()) {
+                    int k = meter.inflate(scratch);
+                    if (k == 0) break;
+                    produced += k;
+                }
+            } catch (DataFormatException e) {
+                produced = BLOCK * 64L;
+            }
+            int blockTimeout = (int) Math.max(15000, 45L * produced / 1000 + 5000);   // ~45 s por MB
             ByteArrayOutputStream d = new ByteArrayOutputStream(n + 16);
             le32(d, n);
             le32(d, seq);
@@ -288,7 +317,7 @@ public class EspFlasher {
             byte[] payload = d.toByteArray();
             for (int attempt = 0; ; attempt++) {
                 try {
-                    check("escribir el firmware", CMD_DEFL_DATA, payload, chk, 15000);
+                    check("escribir el firmware", CMD_DEFL_DATA, payload, chk, blockTimeout);
                     break;
                 } catch (Timeout t) {
                     if (attempt >= 2) throw new FlashException("El ESP32 dejó de responder mientras se grababa. Vuelve a intentarlo.");
@@ -297,6 +326,7 @@ public class EspFlasher {
             int pct = 5 + (int) (93L * (seq + 1) / blocks);
             if (pct != lastPercent) report("Grabando firmware...", pct);
         }
+        meter.end();
         // Con la ROM no se manda FLASH_END: haria arrancar el programa antes de tiempo.
     }
 
