@@ -68,6 +68,8 @@ enum NativeFn {
   NF_IDF_FADE_TIME_START, NF_IDF_FADE_STEP_START, NF_IDF_FIND_RES,
   NF_IDF_GPIO_CONFIG, NF_IDF_GPIO_SET_LEVEL, NF_IDF_GPIO_GET_LEVEL, NF_IDF_GPIO_SET_DIR, NF_IDF_GPIO_RESET,
   NF_IDF_GPIO_PULL, NF_IDF_GPIO_PU_EN, NF_IDF_GPIO_PU_DIS, NF_IDF_GPIO_PD_EN, NF_IDF_GPIO_PD_DIS,
+  // registros del GPIO (GPIO.out_w1ts, REG_WRITE...) y reproductor de secuencias
+  NF_GPIO_REG_WRITE, NF_GPIO_REG_READ, NF_PATTERN_STOP, NF_PATTERN_FREQ,
   NF__COUNT
 };
 
@@ -126,6 +128,12 @@ public:
     return 0;
   }
   virtual std::string nativeStr(int fn) { (void)fn; return std::string(); }
+  // Reproduce en bucle una secuencia sobre varios pines (bit k del paso -> pins[k]) a stepHz pasos/s.
+  virtual double startPattern(const int* pins, int npins, const uint8_t* seq, int len, double stepHz) {
+    (void)pins; (void)npins; (void)seq; (void)len; (void)stepHz;
+    nativeError = "esta funcion no esta disponible aqui";
+    return 0;
+  }
 };
 
 enum RunResult { RUN_OK = 0, RUN_ERROR, RUN_STOPPED, RUN_FINISHED };

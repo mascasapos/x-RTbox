@@ -132,6 +132,19 @@ También funciona el código escrito con la API de ESP‑IDF, que es la que suel
 
 Ejemplos en la app: *PWM_Invertida_IDF* (dos señales de 1 kHz complementarias) y *PWM_Desfase_IDF* (tres fases desfasadas 120°).
 
+### Registros del GPIO y secuencias por hardware
+
+- **Acceso directo a registros**, como en el código de bajo nivel: `GPIO.out_w1ts = mascara;` (encender), `GPIO.out_w1tc = mascara;` (apagar), `GPIO.out`, `GPIO.enable_w1ts`, `GPIO.in`, `GPIO.out1_w1ts.val` (pines 32‑39)… y también `REG_WRITE(GPIO_OUT_W1TS_REG, BIT(19))`, `REG_READ(GPIO_IN_REG)`, `REG_SET_BIT`, `REG_CLR_BIT`. Los pines de la memoria flash quedan protegidos.
+- Ojo: un bucle que cambia pines "lo más rápido posible" funciona, pero interpretado va mucho más lento e irregular que compilado. **Para sacar una secuencia con el tiempo exacto usa el reproductor por hardware**:
+
+```cpp
+const int pines[] = {19, 21};
+int secuencia[] = {1, 0, 2, 0};   // bit 0 = pin 19, bit 1 = pin 21
+patternStart(pines, 2, secuencia, 4, 240);   // 240 pasos por segundo = ciclo de 60 Hz
+```
+
+  Un temporizador del ESP32 cambia todos los pines **a la vez** (una sola escritura en el registro) en cada paso, de 0,01 a 100 000 pasos por segundo, sin depender de lo que haga tu programa. Hasta 8 pines y 4096 pasos. También `patternSetFrequency(pasosPorSegundo)` para cambiar la velocidad en marcha y `patternStop()`. En español: `reproducirSecuencia`, `velocidadSecuencia`, `pararSecuencia`. Ejemplo en la app: *Secuencia_SPWM*.
+
 ### Estructuras (`struct`)
 
 `struct Punto { int x; int y = 0; float peso; };`, `typedef struct { ... } Nombre;`, arrays dentro de estructuras, estructuras dentro de estructuras, arrays de estructuras, inicialización con `{1, 2}` o con `{ .x = 1, .y = 2 }`, `p.x = 5`, copiar con `=`, pasarlas a funciones (por valor, por referencia `Punto &p` o como puntero `&p`), devolverlas, `sizeof` y `typedef enum`.

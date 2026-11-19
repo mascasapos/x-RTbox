@@ -267,8 +267,18 @@ enum XSpecial {
   XS_SPI_TRANSFER = -14, XS_STR = -15, XS_FMIN = -16, XS_FMAX = -17, XS_HYPOT = -18,
   XS_TRUNC = -19, XS_CBRT = -20, XS_VTASKDELAY = -21, XS_IDENT = -22, XS_TICKS = -23,
   XS_DELAYUS = -24, XS_ESPCHECK = -25, XS_ESPCHECK_NA = -26, XS_ERRNAME = -27, XS_PRINTF = -28,
-  XS_LOG = -29, XS_MEMSET = -30, XS_NOOP = -31, XS_BIT = -32
+  XS_LOG = -29, XS_MEMSET = -30, XS_NOOP = -31, XS_BIT = -32, XS_PATTERN = -33, XS_REG = -34
 };
+// Registros del GPIO que se pueden usar (GPIO.out_w1ts, REG_WRITE(GPIO_OUT_W1TS_REG, ...))
+static const char* const kGpioRegs[] = {"out", "out_w1ts", "out_w1tc", "enable", "enable_w1ts", "enable_w1tc", "in",
+                                        "out1", "out1_w1ts", "out1_w1tc", "enable1", "enable1_w1ts", "enable1_w1tc", "in1",
+                                        nullptr};
+static const int64_t GPIO_REG_TAG = 0x7E000000LL;   // valor de las constantes GPIO_..._REG
+static int gpioRegId(const std::string& n) {
+  for (int k = 0; kGpioRegs[k]; k++)
+    if (n == kGpioRegs[k]) return k;
+  return -1;
+}
 
 struct NativeDef {
   const char* name;
@@ -467,6 +477,24 @@ static const NativeDef kNatives[] = {
   {"ESP_LOGV", 2, MAX_ARGS, XS_LOG, 'v', -1, false, 0, 'V'},
   {"memset", 3, 3, XS_MEMSET, 'v', -1, false, 0, 0},
   {"BIT", 1, 1, XS_BIT, 'i', -1, false, 0, 0},
+  // registros del GPIO
+  {"GPIO.write", 2, 2, NF_GPIO_REG_WRITE, 'v', -1, false, 0, 0},
+  {"GPIO.read", 1, 1, NF_GPIO_REG_READ, 'i', -1, false, 0, 0},
+  {"REG_WRITE", 2, 2, XS_REG, 'v', -1, false, 0, 0},
+  {"WRITE_PERI_REG", 2, 2, XS_REG, 'v', -1, false, 0, 0},
+  {"REG_READ", 1, 1, XS_REG, 'i', -1, false, 0, 1},
+  {"READ_PERI_REG", 1, 1, XS_REG, 'i', -1, false, 0, 1},
+  {"REG_SET_BIT", 2, 2, XS_REG, 'v', -1, false, 0, 2},
+  {"SET_PERI_REG_MASK", 2, 2, XS_REG, 'v', -1, false, 0, 2},
+  {"REG_CLR_BIT", 2, 2, XS_REG, 'v', -1, false, 0, 3},
+  {"CLEAR_PERI_REG_MASK", 2, 2, XS_REG, 'v', -1, false, 0, 3},
+  // reproductor de secuencias por hardware (X-RTbox)
+  {"patternStart", 5, 5, XS_PATTERN, 'f', -1, false, 0, 0},
+  {"reproducirSecuencia", 5, 5, XS_PATTERN, 'f', -1, false, 0, 0},
+  {"patternStop", 0, 0, NF_PATTERN_STOP, 'v', -1, false, 0, 0},
+  {"pararSecuencia", 0, 0, NF_PATTERN_STOP, 'v', -1, false, 0, 0},
+  {"patternSetFrequency", 1, 1, NF_PATTERN_FREQ, 'f', -1, false, 0, 0},
+  {"velocidadSecuencia", 1, 1, NF_PATTERN_FREQ, 'f', -1, false, 0, 0},
 };
 static const int kNativeCount = (int)(sizeof(kNatives) / sizeof(kNatives[0]));
 
@@ -2540,6 +2568,12 @@ static bool idfConstant(const std::string& s, int64_t& v) {
     {"ESP_INTR_FLAG_SHARED", 256}, {"ESP_INTR_FLAG_IRAM", 1024}, {nullptr, 0}};
   for (int k = 0; tbl[k].n; k++)
     if (s == tbl[k].n) { v = tbl[k].v; return true; }
+  if (s.size() > 9 && s.compare(0, 5, "GPIO_") == 0 && s.compare(s.size() - 4, 4, "_REG") == 0) {
+    std::string r = s.substr(5, s.size() - 9);
+    for (size_t k = 0; k < r.size(); k++) r[k] = (char)tolower((unsigned char)r[k]);
+    int id = gpioRegId(r);
+    if (id >= 0) { v = GPIO_REG_TAG + id; return true; }
+  }
   return numSuffix(s, "LEDC_CHANNEL_", "", 0, 7, v) || numSuffix(s, "LEDC_TIMER_", "_BIT", 1, 20, v) ||
          numSuffix(s, "LEDC_TIMER_", "", 0, 3, v) || numSuffix(s, "GPIO_NUM_", "", 0, 56, v);
 }
@@ -2826,6 +2860,58 @@ Node* Parser::parseIdentExpr(const Token& t) {
       failAt(line, "'%s' se usa con un punto, por ejemplo %s.begin()", s.c_str(), s.c_str());
       return nullptr;
     }
+  }
+  // Registros del GPIO: GPIO.out_w1ts = mascara;  x = GPIO.in;  GPIO.out |= bit;
+  if (s == "GPIO" && isOp('.')) {
+    skip();
+    std::string f;
+    if (!expectIdent(f)) return nullptr;
+    int reg = gpioRegId(f);
+    if (reg < 0) {
+      failAt(line, "GPIO.%s no esta soportado (usa out, out_w1ts, out_w1tc, enable, enable_w1ts, enable_w1tc, in, out1...)", f.c_str());
+      return nullptr;
+    }
+    if (isOp('.') && peek(1).type == TK_IDENT) { skip(); skip(); }   // GPIO.out_w1ts.val
+    Node* regN = mk(N_NUM, line);
+    if (!regN) return nullptr;
+    regN->ival = reg;
+    int aop = assignOpOf(peek());
+    Node* n = mk(N_PCALL, line);
+    if (!n) return nullptr;
+    PendingCall pc;
+    pc.n = n;
+    if (aop) {
+      skip();
+      Node* rhs = parseAssign();
+      if (failed) return nullptr;
+      if (aop != '=') {   // GPIO.out |= x  ->  escribir(leer | x)
+        Node* rd = mk(N_PCALL, line);
+        Node* r2 = mk(N_NUM, line);
+        Node* bin = mk(N_BIN, line);
+        if (!rd || !r2 || !bin) return nullptr;
+        r2->ival = reg;
+        rd->b = r2;
+        rd->ival = 1;
+        PendingCall pr;
+        pr.n = rd;
+        pr.name = "GPIO.read";
+        pendingCalls.push_back(pr);
+        bin->a = rd;
+        bin->b = rhs;
+        bin->idx = aop == 'L' ? OP_SHL : (aop == 'R' ? OP_SHR : aop);
+        rhs = bin;
+      }
+      regN->next = rhs;
+      n->b = regN;
+      n->ival = 2;
+      pc.name = "GPIO.write";
+    } else {
+      n->b = regN;
+      n->ival = 1;
+      pc.name = "GPIO.read";
+    }
+    pendingCalls.push_back(pc);
+    return n;
   }
   // Nombre::VALOR (enum class)
   if (isOp(OP_SCOPE) && typeAliases.count(s)) {
@@ -4131,6 +4217,55 @@ Value Impl::nativeCall(Node* n) {
       }
       out(txt);
       return Value::I((int64_t)txt.size());
+    }
+    case XS_REG: {   // REG_WRITE / REG_READ / REG_SET_BIT / REG_CLR_BIT sobre registros GPIO
+      int64_t addr = asInt(av[0]);
+      int reg = (int)(addr - GPIO_REG_TAG);
+      if (addr < GPIO_REG_TAG || reg < 0 || reg > 13) {
+        fail(line, "%s() solo admite los registros del GPIO (GPIO_OUT_W1TS_REG, GPIO_OUT_W1TC_REG, GPIO_OUT_REG, GPIO_IN_REG...)", d.name);
+        return Value();
+      }
+      double args[2] = {(double)reg, 0};
+      hal.nativeError.clear();
+      if (d.aux != 0) args[1] = hal.native(NF_GPIO_REG_READ, args, 1);
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      if (d.aux == 1) return Value::I((int64_t)args[1]);
+      uint32_t cur = (uint32_t)(int64_t)args[1], v = (uint32_t)asInt(av[1]);
+      args[1] = d.aux == 0 ? v : (d.aux == 2 ? (cur | v) : (cur & ~v));
+      hal.native(NF_GPIO_REG_WRITE, args, 2);
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      return Value();
+    }
+    case XS_PATTERN: {   // patternStart(pines, numPines, secuencia, longitud, pasosPorSegundo)
+      if (av[0].t != V_ARR || av[2].t != V_ARR) {
+        fail(line, "uso: %s(pines, numPines, secuencia, longitud, pasosPorSegundo); pines y secuencia son arrays", d.name);
+        return Value();
+      }
+      if (!av[1].isNum() || !av[3].isNum() || !av[4].isNum()) { fail(line, "%s(): numPines, longitud y pasosPorSegundo son numeros", d.name); return Value(); }
+      int64_t np = asInt(av[1]), len = asInt(av[3]);
+      if (np < 1 || np > 8 || np > (int64_t)av[0].a->v.size()) { fail(line, "%s(): numPines va de 1 a 8 (y no puede pasar del tamano del array de pines)", d.name); return Value(); }
+      if (len < 1 || len > 4096 || len > (int64_t)av[2].a->v.size()) { fail(line, "%s(): la longitud va de 1 a 4096 (y no puede pasar del tamano de la secuencia)", d.name); return Value(); }
+      std::vector<int> pins((size_t)np);
+      for (int64_t k = 0; k < np; k++) {
+        pins[(size_t)k] = (int)asInt(av[0].a->v[(size_t)k]);
+        const char* pe = hal.pinError(pins[(size_t)k], true);
+        if (pe) { fail(line, "%s", pe); return Value(); }
+      }
+      std::vector<uint8_t> seq((size_t)len);
+      int64_t maxv = (1LL << np) - 1;
+      for (int64_t k = 0; k < len; k++) {
+        int64_t v = asInt(av[2].a->v[(size_t)k]);
+        if (v < 0 || v > maxv) {
+          fail(line, "%s(): el paso %lld vale %lld; con %lld pines cada paso va de 0 a %lld (bit 0 = primer pin)", d.name,
+               (long long)k, (long long)v, (long long)np, (long long)maxv);
+          return Value();
+        }
+        seq[(size_t)k] = (uint8_t)v;
+      }
+      hal.nativeError.clear();
+      double r = hal.startPattern(pins.data(), (int)np, seq.data(), (int)len, num(av[4]));
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      return Value::F(r);
     }
     case XS_MEMSET:
       if (av[0].t != V_ARR) { fail(line, "memset() solo funciona con estructuras y arrays: memset(&x, 0, sizeof(x))"); return Value(); }

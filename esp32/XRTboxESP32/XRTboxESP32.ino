@@ -43,6 +43,8 @@
 #include "esp_idf_version.h"
 #include "esp32-hal-periman.h"
 #include "driver/ledc.h"
+#include "soc/soc.h"
+#include "soc/gpio_reg.h"
 #include <Wire.h>
 #include <SPI.h>
 #include "MiniC.h"
@@ -366,6 +368,33 @@ static void ARDUINO_ISR_ATTR ddsIsr() {
     }
 #endif
   }
+}
+
+// Reproductor de secuencias (patternStart): un temporizador cambia varios pines
+// a la vez, con una sola escritura en el registro de salida del GPIO.
+struct PatMask { uint32_t set0, set1; };
+struct PatState {
+  volatile bool on;
+  uint8_t* seq;
+  PatMask* lut;
+  int len;
+  volatile int pos;
+  uint32_t mask0, mask1;   // pines de la secuencia (0-31 y 32-63)
+};
+static PatState pat = {false, nullptr, nullptr, 0, 0, 0, 0};
+static hw_timer_t* patTimer = nullptr;
+static uint32_t patRes = 0;
+
+static void ARDUINO_ISR_ATTR patIsr() {
+  if (!pat.on) return;
+  int p = pat.pos;
+  const PatMask m = pat.lut[pat.seq[p]];
+  if (++p >= pat.len) p = 0;
+  pat.pos = p;
+  REG_WRITE(GPIO_OUT_REG, (REG_READ(GPIO_OUT_REG) & ~pat.mask0) | m.set0);
+#ifdef GPIO_OUT1_REG
+  if (pat.mask1) REG_WRITE(GPIO_OUT1_REG, (REG_READ(GPIO_OUT1_REG) & ~pat.mask1) | m.set1);
+#endif
 }
 
 static int dacChannelOf(int pin) {
@@ -840,6 +869,125 @@ class EspHal : public minic::Hal {
     stopDds(gpio);
     releaseLedc(gpio);
     if (out) markOut(gpio);
+  }
+
+  // ---- registros del GPIO ----
+  uint32_t gpioSafeMask(int bank) {   // pines que el programa puede tocar (no los de la memoria flash)
+    uint32_t m = 0;
+    for (int k = 0; k < 32; k++) {
+      int p = bank * 32 + k;
+      if (p < SOC_GPIO_PIN_COUNT && pinError(p, true) == nullptr) m |= 1u << k;
+    }
+    return m;
+  }
+  bool gpioReg(int r, uint32_t& addr) {
+    switch (r) {
+      case 0: addr = GPIO_OUT_REG; return true;
+      case 1: addr = GPIO_OUT_W1TS_REG; return true;
+      case 2: addr = GPIO_OUT_W1TC_REG; return true;
+      case 3: addr = GPIO_ENABLE_REG; return true;
+      case 4: addr = GPIO_ENABLE_W1TS_REG; return true;
+      case 5: addr = GPIO_ENABLE_W1TC_REG; return true;
+      case 6: addr = GPIO_IN_REG; return true;
+#ifdef GPIO_OUT1_REG
+      case 7: addr = GPIO_OUT1_REG; return true;
+      case 8: addr = GPIO_OUT1_W1TS_REG; return true;
+      case 9: addr = GPIO_OUT1_W1TC_REG; return true;
+      case 10: addr = GPIO_ENABLE1_REG; return true;
+      case 11: addr = GPIO_ENABLE1_W1TS_REG; return true;
+      case 12: addr = GPIO_ENABLE1_W1TC_REG; return true;
+      case 13: addr = GPIO_IN1_REG; return true;
+#endif
+      default: break;
+    }
+    nfail(r >= 7 && r <= 13 ? "este ESP32 no tiene pines del 32 en adelante (usa los registros sin '1')" : "registro GPIO no valido");
+    return false;
+  }
+  double gpioRegWrite(int r, uint32_t v) {
+    uint32_t addr;
+    if (!gpioReg(r, addr)) return 0;
+    int bank = r >= 7 ? 1 : 0;
+    uint32_t safe = gpioSafeMask(bank);
+    int kind = (r >= 7 ? r - 7 : r);   // 0 out, 1 w1ts, 2 w1tc, 3 enable, 4 enable_w1ts, 5 enable_w1tc, 6 in
+    if (kind == 6) return nfail("GPIO.in solo se puede leer");
+    if (kind == 3 || kind == 4) {   // habilitar salidas: nunca en los pines de la memoria flash
+      uint32_t bad = v & ~safe;
+      if (kind == 3) bad &= ~REG_READ(addr);
+      if (bad) return nfail("ese valor activa como salida el pin %d, que no se puede usar", bank * 32 + __builtin_ctz(bad));
+      for (int k = 0; k < 32; k++)
+        if (v & (1u << k)) markOut(bank * 32 + k);
+    }
+    if (kind == 0 || kind == 3) REG_WRITE(addr, (REG_READ(addr) & ~safe) | (v & safe));
+    else REG_WRITE(addr, v & safe);
+    return 0;
+  }
+
+  // ---- reproductor de secuencias ----
+  void stopPattern() {
+    pat.on = false;
+    if (patTimer) { ::timerEnd(patTimer); patTimer = nullptr; }
+    if (pat.mask0) REG_WRITE(GPIO_OUT_W1TC_REG, pat.mask0);   // los pines quedan a 0
+#ifdef GPIO_OUT1_REG
+    if (pat.mask1) REG_WRITE(GPIO_OUT1_W1TC_REG, pat.mask1);
+#endif
+    free(pat.seq);
+    free(pat.lut);
+    pat.seq = nullptr;
+    pat.lut = nullptr;
+    pat.mask0 = pat.mask1 = 0;
+    pat.len = 0;
+  }
+  uint64_t patAlarm(double hz) {
+    double t = (double)patRes / hz;
+    if (t < 1) t = 1;
+    return (uint64_t)llround(t);
+  }
+  double startPattern(const int* pins, int np, const uint8_t* seq, int len, double hz) override {
+    if (!(hz > 0) || hz > 100000) return nfail("pasosPorSegundo debe estar entre 0 y 100000");
+    stopPattern();
+    uint32_t m0 = 0, m1 = 0;
+    for (int k = 0; k < np; k++) {
+      int p = pins[k];
+      if (!pinOk(p, true)) return 0;
+      if (p >= 64) return nfail("el pin %d no sirve para la secuencia", p);
+      for (int q = 0; q < k; q++)
+        if (pins[q] == p) return nfail("el pin %d esta repetido", p);
+      stopDds(p);
+      releaseLedc(p);
+      ::pinMode(p, OUTPUT);
+      ::digitalWrite(p, LOW);
+      markOut(p);
+      if (p < 32) m0 |= 1u << p;
+      else m1 |= 1u << (p - 32);
+    }
+    pat.lut = (PatMask*)malloc(sizeof(PatMask) << np);
+    pat.seq = (uint8_t*)malloc((size_t)len);
+    if (!pat.lut || !pat.seq) { stopPattern(); return nfail("no hay memoria para la secuencia"); }
+    for (int v = 0; v < (1 << np); v++) {
+      PatMask m = {0, 0};
+      for (int k = 0; k < np; k++) {
+        if (!(v & (1 << k))) continue;
+        if (pins[k] < 32) m.set0 |= 1u << pins[k];
+        else m.set1 |= 1u << (pins[k] - 32);
+      }
+      pat.lut[v] = m;
+    }
+    memcpy(pat.seq, seq, (size_t)len);
+    pat.len = len;
+    pat.pos = 0;
+    pat.mask0 = m0;
+    pat.mask1 = m1;
+    static const uint32_t resList[] = {40000000, 10000000, 1000000};
+    for (int k = 0; k < 3 && !patTimer; k++) {
+      patTimer = ::timerBegin(resList[k]);
+      if (patTimer) patRes = resList[k];
+    }
+    if (!patTimer) { stopPattern(); return nfail("no queda ningun temporizador libre"); }
+    uint64_t alarm = patAlarm(hz);
+    ::timerAttachInterrupt(patTimer, patIsr);
+    pat.on = true;
+    ::timerAlarm(patTimer, alarm, true, 0);
+    return (double)patRes / (double)alarm;
   }
 
   UserTimer* timerOf(double h) {
@@ -1352,6 +1500,26 @@ class EspHal : public minic::Hal {
       }
       case NF_ESP_RANDOM: return (double)esp_random();
 
+      // ---------------- registros del GPIO y secuencias ----------------
+      case NF_GPIO_REG_WRITE:
+        return gpioRegWrite((int)a[0], (uint32_t)(int64_t)a[1]);
+      case NF_GPIO_REG_READ: {
+        uint32_t addr;
+        if (!gpioReg((int)a[0], addr)) return 0;
+        return (double)REG_READ(addr);
+      }
+      case NF_PATTERN_STOP:
+        stopPattern();
+        return 0;
+      case NF_PATTERN_FREQ: {
+        double hz = a[0];
+        if (!patTimer) return nfail("no hay ninguna secuencia en marcha (usa antes patternStart)");
+        if (!(hz > 0) || hz > 100000) return nfail("pasosPorSegundo debe estar entre 0 y 100000");
+        uint64_t alarm = patAlarm(hz);
+        ::timerAlarm(patTimer, alarm, true, 0);
+        return (double)patRes / (double)alarm;
+      }
+
       // ---------------- extras de Arduino ----------------
       case NF_LEDC_INVERT: {
         int pin = (int)a[0];
@@ -1558,6 +1726,7 @@ class EspHal : public minic::Hal {
   // Deja los pines en un estado seguro al detener un programa
   void resetHardware() {
     // primero se paran todas las fuentes de interrupciones
+    stopPattern();
     for (int c = 0; c < DDS_MAX; c++) dds[c].kind = DDS_OFF;
     if (ddsTimer) { ::timerEnd(ddsTimer); ddsTimer = nullptr; }
     for (int c = 0; c < DDS_MAX; c++) dds[c].pin = -1;
