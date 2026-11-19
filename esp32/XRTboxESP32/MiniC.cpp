@@ -267,7 +267,7 @@ enum XSpecial {
   XS_SPI_TRANSFER = -14, XS_STR = -15, XS_FMIN = -16, XS_FMAX = -17, XS_HYPOT = -18,
   XS_TRUNC = -19, XS_CBRT = -20, XS_VTASKDELAY = -21, XS_IDENT = -22, XS_TICKS = -23,
   XS_DELAYUS = -24, XS_ESPCHECK = -25, XS_ESPCHECK_NA = -26, XS_ERRNAME = -27, XS_PRINTF = -28,
-  XS_LOG = -29, XS_MEMSET = -30, XS_NOOP = -31, XS_BIT = -32, XS_PATTERN = -33, XS_REG = -34
+  XS_LOG = -29, XS_MEMSET = -30, XS_NOOP = -31, XS_BIT = -32, XS_PATTERN = -33, XS_REG = -34, XS_DTABLE = -35
 };
 // Registros del GPIO que se pueden usar (GPIO.out_w1ts, REG_WRITE(GPIO_OUT_W1TS_REG, ...))
 static const char* const kGpioRegs[] = {"out", "out_w1ts", "out_w1tc", "enable", "enable_w1ts", "enable_w1tc", "in",
@@ -495,6 +495,17 @@ static const NativeDef kNatives[] = {
   {"pararSecuencia", 0, 0, NF_PATTERN_STOP, 'v', -1, false, 0, 0},
   {"patternSetFrequency", 1, 1, NF_PATTERN_FREQ, 'f', -1, false, 0, 0},
   {"velocidadSecuencia", 1, 1, NF_PATTERN_FREQ, 'f', -1, false, 0, 0},
+  // tablas de duty para PWM senoidal (SPWM) aplicadas por hardware
+  {"pwmTableAdd", 4, 4, XS_DTABLE, 'v', -1, false, 0, 1},
+  {"tablaPWM", 4, 4, XS_DTABLE, 'v', -1, false, 0, 1},
+  {"pwmTableAddPin", 3, 3, XS_DTABLE, 'v', 0, true, 0, 2},
+  {"tablaPWMPin", 3, 3, XS_DTABLE, 'v', 0, true, 0, 2},
+  {"pwmTableStart", 1, 1, NF_DTABLE_START, 'f', -1, false, 0, 0},
+  {"iniciarTablasPWM", 1, 1, NF_DTABLE_START, 'f', -1, false, 0, 0},
+  {"pwmTableSetRate", 1, 1, NF_DTABLE_RATE, 'f', -1, false, 0, 0},
+  {"velocidadTablasPWM", 1, 1, NF_DTABLE_RATE, 'f', -1, false, 0, 0},
+  {"pwmTableStop", 0, 0, NF_DTABLE_STOP, 'v', -1, false, 0, 0},
+  {"pararTablasPWM", 0, 0, NF_DTABLE_STOP, 'v', -1, false, 0, 0},
 };
 static const int kNativeCount = (int)(sizeof(kNatives) / sizeof(kNatives[0]));
 
@@ -503,6 +514,15 @@ static int findBuiltin(const std::string& name) {
     if (name == kBuiltins[k].name) return k;
   for (int k = 0; k < kNativeCount; k++)
     if (name == kNatives[k].name) return B__COUNT + k;
+  // versiones float de C: sinf, cosf, sqrtf, powf, fabsf...
+  static const char* const fl[] = {"sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sqrt", "pow", "exp",
+                                   "log", "log10", "floor", "ceil", "round", "fabs", "fmod", "fmin", "fmax",
+                                   "hypot", "trunc", "cbrt", nullptr};
+  if (name.size() > 2 && name[name.size() - 1] == 'f') {
+    std::string b = name.substr(0, name.size() - 1);
+    for (int k = 0; fl[k]; k++)
+      if (b == fl[k]) return findBuiltin(b);
+  }
   return -1;
 }
 
@@ -1048,6 +1068,14 @@ struct Impl {
   struct StructDef { std::string name; std::vector<StructField> f; };
   std::vector<StructDef> structs;
   std::vector<std::string> names;
+  // interrupcion de temporizador que se ejecuta por hardware (tabla[idx] -> duty PWM)
+  struct AccelTrack { int kind; int a; int b; int tableSlot; };
+  struct AccelSpec { int handle; int fi; int idxSlot; int64_t len; std::vector<AccelTrack> tracks; };
+  AccelSpec accel;
+  bool matchDutyStmt(Node* st, AccelSpec& sp, int& incs, int& wraps, int64_t& bound);
+  bool constNode(Node* n, int64_t& out);
+  bool recognizeDutyIsr(int fi, AccelSpec& sp);
+  bool syncAccel(int line);
   // interrupciones diferidas: bit del evento -> funcion del programa
   int eventFunc[32];
   int eventMask;
@@ -1057,6 +1085,7 @@ struct Impl {
       : hal(h), err(e), stopReq(s), setupIdx(-1), loopIdx(-1), loaded(false), sp(0), fp(0), depth(0),
         abort_(false), steps(0), rng(0x2545F491u), eventMask(0), inEvent(false) {
     for (int k = 0; k < 32; k++) eventFunc[k] = -1;
+    accel.handle = 0;
   }
 
   void clearProgram() {
@@ -4157,6 +4186,164 @@ Value Impl::builtin(Node* n) {
   }
 }
 
+// ---- interrupciones de temporizador que se pueden hacer por hardware ----
+// Reconoce funciones como:
+//   void alTick() {
+//     ledc_set_duty_and_update(MODO, CANAL_0, tablaA[idx], 0);   (o ledc_set_duty + ledc_update_duty, o ledcWrite(pin, t[idx]))
+//     ledc_set_duty_and_update(MODO, CANAL_1, tablaB[idx], 0);
+//     if (++idx >= N) idx = 0;                                    (o idx++; if (idx >= N) idx = 0;  o  idx = (idx + 1) % N;)
+//   }
+bool Impl::constNode(Node* n, int64_t& out) {
+  if (!n) return false;
+  switch (n->kind) {
+    case N_NUM: case N_FLT: case N_GVAR: break;
+    case N_BIN: { int64_t x; if (!constNode(n->a, x) || !constNode(n->b, x)) return false; break; }
+    case N_CAST: case N_NEG: case N_POS: { int64_t x; if (!constNode(n->a, x)) return false; break; }
+    default: return false;
+  }
+  Value v = eval(n);
+  if (abort_ || !v.isNum()) return false;
+  out = v.t == V_INT ? v.i : f2i(v.f);
+  return true;
+}
+
+static Node* nthArg(Node* call, int k) {
+  Node* a = call->b;
+  while (a && k-- > 0) a = a->next;
+  return a;
+}
+
+static int nativeNf(Node* e) {
+  if (!e || e->kind != N_BUILTIN || e->idx < B__COUNT) return 0;
+  return kNatives[e->idx - B__COUNT].nf;
+}
+
+static bool isVar(Node* n, int slot) { return n && n->kind == N_GVAR && (slot < 0 || n->idx == slot); }
+
+static bool isZeroAssign(Node* st, int slot) {   // idx = 0;
+  if (st && st->kind == N_BLOCK && st->a && !st->a->next) st = st->a;
+  if (!st || st->kind != N_EXPR || !st->a || st->a->kind != N_ASSIGN || st->a->op != '=') return false;
+  Node* as = st->a;
+  return isVar(as->a, slot) && as->b->kind == N_NUM && as->b->ival == 0;
+}
+
+bool Impl::matchDutyStmt(Node* st, AccelSpec& sp, int& incs, int& wraps, int64_t& bound) {
+  if (!st) return true;
+  if (st->kind == N_EMPTY) return true;
+  if (st->kind == N_BLOCK) {
+    for (Node* s2 = st->a; s2; s2 = s2->next)
+      if (!matchDutyStmt(s2, sp, incs, wraps, bound)) return false;
+    return true;
+  }
+  if (st->kind == N_IF) {   // if (++idx >= N) idx = 0;   if (idx >= N) idx = 0;
+    if (st->c) return false;
+    Node* c = st->a;
+    if (!c || c->kind != N_BIN || (c->idx != OP_GE && c->idx != OP_EQ)) return false;
+    Node* x = c->a;
+    bool pre = x && x->kind == N_PREINC;
+    Node* var = pre ? x->a : x;
+    if (!isVar(var, sp.idxSlot)) return false;
+    sp.idxSlot = var->idx;
+    int64_t b;
+    if (!constNode(c->b, b)) return false;
+    if (!isZeroAssign(st->b, sp.idxSlot)) return false;
+    if (pre) incs++;
+    wraps++;
+    bound = b;
+    return true;
+  }
+  if (st->kind != N_EXPR) return false;
+  Node* e = st->a;
+  if (!e) return true;
+  if ((e->kind == N_PREINC || e->kind == N_POSTINC) && isVar(e->a, sp.idxSlot)) {   // idx++;
+    sp.idxSlot = e->a->idx;
+    incs++;
+    return true;
+  }
+  if (e->kind == N_ASSIGN && isVar(e->a, sp.idxSlot)) {
+    if (e->op == '+' && e->b->kind == N_NUM && e->b->ival == 1) { sp.idxSlot = e->a->idx; incs++; return true; }   // idx += 1;
+    Node* m = e->b;   // idx = (idx + 1) % N;
+    if (e->op == '=' && m && m->kind == N_BIN && m->idx == '%' && m->a && m->a->kind == N_BIN && m->a->idx == '+' &&
+        isVar(m->a->a, e->a->idx) && m->a->b->kind == N_NUM && m->a->b->ival == 1) {
+      int64_t b;
+      if (!constNode(m->b, b)) return false;
+      sp.idxSlot = e->a->idx;
+      incs++;
+      wraps++;
+      bound = b;
+      return true;
+    }
+    return false;
+  }
+  if (e->kind != N_BUILTIN) return false;
+  if (e->idx >= B__COUNT && (kNatives[e->idx - B__COUNT].flags & XF_NOEVAL)) return true;   // portENTER_CRITICAL...
+  int nf = nativeNf(e);
+  if (nf == NF_IDF_UPDATE_DUTY) return true;
+  AccelTrack t;
+  Node* tab;
+  if (nf == NF_IDF_SET_DUTY_UPDATE || nf == NF_IDF_SET_DUTY || nf == NF_IDF_SET_DUTY_HPOINT) {
+    int64_t mode, ch;
+    if (!constNode(nthArg(e, 0), mode) || !constNode(nthArg(e, 1), ch)) return false;
+    t.kind = 1; t.a = (int)mode; t.b = (int)ch;
+    tab = nthArg(e, 2);
+  } else if (nf == NF_LEDC_WRITE) {
+    int64_t pin;
+    if (!constNode(nthArg(e, 0), pin)) return false;
+    t.kind = 2; t.a = (int)pin; t.b = 0;
+    tab = nthArg(e, 1);
+  } else {
+    return false;
+  }
+  if (!tab || tab->kind != N_INDEX || !isVar(tab->a, -1) || !isVar(tab->b, sp.idxSlot)) return false;
+  sp.idxSlot = tab->b->idx;
+  t.tableSlot = tab->a->idx;
+  sp.tracks.push_back(t);
+  return true;
+}
+
+bool Impl::recognizeDutyIsr(int fi, AccelSpec& sp) {
+  Node* body = funcs[fi].body;
+  if (!body || body->kind != N_BLOCK) return false;
+  sp.fi = fi;
+  sp.idxSlot = -1;
+  sp.len = 0;
+  sp.tracks.clear();
+  int incs = 0, wraps = 0;
+  int64_t bound = 0;
+  bool ok = matchDutyStmt(body, sp, incs, wraps, bound);
+  if (abort_) { abort_ = false; err.clear(); return false; }
+  if (!ok || incs != 1 || wraps != 1 || sp.tracks.empty() || sp.tracks.size() > 8 || bound < 1 || bound > 4096) return false;
+  sp.len = bound;
+  return true;
+}
+
+bool Impl::syncAccel(int line) {
+  hal.nativeError.clear();
+  hal.dutyTable(0, 0, 0, nullptr, 0);
+  for (size_t k = 0; k < accel.tracks.size(); k++) {
+    const AccelTrack& t = accel.tracks[k];
+    const Value& tv = globals[(size_t)t.tableSlot];
+    if (tv.t != V_ARR || (int64_t)tv.a->v.size() < accel.len) {
+      fail(line, "la tabla de %s() tiene menos de %lld muestras", funcs[accel.fi].name.c_str(), (long long)accel.len);
+      return false;
+    }
+    std::vector<uint32_t> data((size_t)accel.len);
+    for (int64_t q = 0; q < accel.len; q++) {
+      const Value& e = tv.a->v[(size_t)q];
+      int64_t v = e.isNum() ? asInt(e) : 0;
+      data[(size_t)q] = (uint32_t)(v < 0 ? 0 : (v > 1048576 ? 1048576 : v));
+    }
+    hal.dutyTable(t.kind, t.a, t.b, data.data(), (int)accel.len);
+    if (!hal.nativeError.empty()) { fail(line, "%s(): %s", funcs[accel.fi].name.c_str(), hal.nativeError.c_str()); return false; }
+  }
+  const Value& iv = globals[(size_t)accel.idxSlot];
+  int64_t pos = iv.isNum() ? asInt(iv) : 0;
+  double args[2] = {(double)accel.handle, (double)(((pos % accel.len) + accel.len) % accel.len)};
+  hal.native(NF_DTABLE_BIND, args, 2);
+  if (!hal.nativeError.empty()) { fail(line, "%s(): %s", funcs[accel.fi].name.c_str(), hal.nativeError.c_str()); return false; }
+  return true;
+}
+
 // ---- funciones del ESP32 ----
 Value Impl::nativeCall(Node* n) {
   const NativeDef& d = kNatives[n->idx - B__COUNT];
@@ -4233,6 +4420,27 @@ Value Impl::nativeCall(Node* n) {
       uint32_t cur = (uint32_t)(int64_t)args[1], v = (uint32_t)asInt(av[1]);
       args[1] = d.aux == 0 ? v : (d.aux == 2 ? (cur | v) : (cur & ~v));
       hal.native(NF_GPIO_REG_WRITE, args, 2);
+      if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
+      return Value();
+    }
+    case XS_DTABLE: {   // pwmTableAdd(modo, canal, tabla, longitud) / pwmTableAddPin(pin, tabla, longitud)
+      int ta = d.aux == 1 ? 2 : 1;
+      if (av[ta].t != V_ARR) { fail(line, "%s(): la tabla debe ser un array", d.name); return Value(); }
+      for (int q = 0; q < na; q++)
+        if (q != ta && !av[q].isNum()) { fail(line, "%s(): el argumento %d debe ser un numero", d.name, q + 1); return Value(); }
+      int64_t len = asInt(av[ta + 1]);
+      ArrObj* arr = av[ta].a;
+      if (len < 1 || len > 4096 || len > (int64_t)arr->v.size()) { fail(line, "%s(): la longitud va de 1 a 4096 (y no puede pasar del tamano de la tabla)", d.name); return Value(); }
+      std::vector<uint32_t> data((size_t)len);
+      for (int64_t q = 0; q < len; q++) {
+        const Value& e = arr->v[(size_t)q];
+        if (!e.isNum()) { fail(line, "%s(): la tabla solo puede tener numeros", d.name); return Value(); }
+        int64_t v = asInt(e);
+        data[(size_t)q] = (uint32_t)(v < 0 ? 0 : (v > 1048576 ? 1048576 : v));
+      }
+      hal.nativeError.clear();
+      if (d.aux == 1) hal.dutyTable(1, (int)asInt(av[0]), (int)asInt(av[1]), data.data(), (int)len);
+      else hal.dutyTable(2, (int)asInt(av[0]), 0, data.data(), (int)len);
       if (!hal.nativeError.empty()) { fail(line, "%s(): %s", d.name, hal.nativeError.c_str()); return Value(); }
       return Value();
     }
@@ -4360,6 +4568,17 @@ Value Impl::nativeCall(Node* n) {
       } else {
         nfn = NF_TIMER_ATTACH;
         cnt = 1;
+        AccelSpec sp;
+        if (recognizeDutyIsr(fi, sp)) {   // tabla[idx] -> duty: la hace el hardware
+          sp.handle = (int)args[0];
+          accel = sp;
+          if (!syncAccel(line)) return Value();
+          char msg[200];
+          snprintf(msg, sizeof msg, "[X-RTbox] %s() se ejecuta en el hardware: %d salida(s) PWM con tablas de %lld muestras\r\n",
+                   funcs[fi].name.c_str(), (int)sp.tracks.size(), (long long)sp.len);
+          out(msg);
+          return Value();
+        }
       }
       hal.nativeError.clear();
       int slot = (int)hal.native(nfn, args, cnt);
@@ -4450,6 +4669,9 @@ Value Impl::nativeCall(Node* n) {
   if (d.pinArg >= 0 && d.pinArg < na) {
     const char* pe = hal.pinError((int)asInt(av[d.pinArg]), d.pinOut);
     if (pe) { fail(line, "%s", pe); return Value(); }
+  }
+  if ((d.nf == NF_TIMER_ALARM || d.nf == NF_TIMER_ALARM_ENABLE) && accel.handle != 0 && (int)args[0] == accel.handle) {
+    if (!syncAccel(line)) return Value();   // las tablas pueden haber cambiado desde timerAttachInterrupt
   }
   hal.nativeError.clear();
   double r = hal.native(d.nf, args, k);
@@ -4690,6 +4912,8 @@ RunResult Interpreter::start() {
   m.stack.resize(STACK_SLOTS);
   m.sp = 0; m.fp = 0; m.depth = 0;
   for (int k = 0; k < 32; k++) m.eventFunc[k] = -1;
+  m.accel.handle = 0;
+  m.accel.tracks.clear();
   m.eventMask = 0;
   m.inEvent = false;
   hal.takeEvents();

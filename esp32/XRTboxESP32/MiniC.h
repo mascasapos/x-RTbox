@@ -70,6 +70,8 @@ enum NativeFn {
   NF_IDF_GPIO_PULL, NF_IDF_GPIO_PU_EN, NF_IDF_GPIO_PU_DIS, NF_IDF_GPIO_PD_EN, NF_IDF_GPIO_PD_DIS,
   // registros del GPIO (GPIO.out_w1ts, REG_WRITE...) y reproductor de secuencias
   NF_GPIO_REG_WRITE, NF_GPIO_REG_READ, NF_PATTERN_STOP, NF_PATTERN_FREQ,
+  // tablas de duty para PWM (SPWM): las aplica el hardware muestra a muestra
+  NF_DTABLE_START, NF_DTABLE_STOP, NF_DTABLE_RATE, NF_DTABLE_BIND,
   NF__COUNT
 };
 
@@ -128,6 +130,12 @@ public:
     return 0;
   }
   virtual std::string nativeStr(int fn) { (void)fn; return std::string(); }
+  // Tablas de duty: op 0 = borrar todas, 1 = canal LEDC (a = modo, b = canal), 2 = pin con ledcAttach (a = pin).
+  virtual double dutyTable(int op, int a, int b, const uint32_t* data, int len) {
+    (void)op; (void)a; (void)b; (void)data; (void)len;
+    nativeError = "esta funcion no esta disponible aqui";
+    return 0;
+  }
   // Reproduce en bucle una secuencia sobre varios pines (bit k del paso -> pins[k]) a stepHz pasos/s.
   virtual double startPattern(const int* pins, int npins, const uint8_t* seq, int len, double stepHz) {
     (void)pins; (void)npins; (void)seq; (void)len; (void)stepHz;

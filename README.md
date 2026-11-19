@@ -145,6 +145,25 @@ patternStart(pines, 2, secuencia, 4, 240);   // 240 pasos por segundo = ciclo de
 
   Un temporizador del ESP32 cambia todos los pines **a la vez** (una sola escritura en el registro) en cada paso, de 0,01 a 100 000 pasos por segundo, sin depender de lo que haga tu programa. Hasta 8 pines y 4096 pasos. También `patternSetFrequency(pasosPorSegundo)` para cambiar la velocidad en marcha y `patternStop()`. En español: `reproducirSecuencia`, `velocidadSecuencia`, `pararSecuencia`. Ejemplo en la app: *Secuencia_SPWM*.
 
+### PWM senoidal (SPWM) con tablas, por hardware
+
+El código típico de SPWM usa una interrupción de temporizador muy rápida (por ejemplo 20 000 veces por segundo) que copia la muestra siguiente de una tabla en el duty del PWM. El intérprete no puede atender tantas interrupciones, así que X‑RTbox **reconoce ese tipo de interrupción y la ejecuta el firmware en C**, con tu código tal cual. Al cargarlo verás en la consola `[X-RTbox] alTick() se ejecuta en el hardware`. Reconoce interrupciones que solo tienen:
+
+- `ledc_set_duty_and_update(modo, canal, tabla[idx], 0);`, o `ledc_set_duty(modo, canal, tabla[idx]); ledc_update_duty(modo, canal);`, o `ledcWrite(pin, tabla[idx]);` (hasta 8 canales);
+- y el avance del índice: `if (++idx >= N) idx = 0;`, `idx++; if (idx >= N) idx = 0;` o `idx = (idx + 1) % N;`.
+
+Las tablas se copian al hardware al hacer `timerAttachInterrupt` y `timerAlarm`: si las cambias después, vuelve a llamar a `timerAlarm`. Si la interrupción hace otras cosas, se ejecuta interpretada, y si va a más de 2000 por segundo la consola te avisa de que irá con retraso.
+
+También puedes hacerlo directamente, sin interrupción propia:
+
+```cpp
+pwmTableAddPin(19, tablaA, 400);   // o pwmTableAdd(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, tablaA, 400)
+pwmTableAddPin(21, tablaB, 400);
+pwmTableStart(20000);              // muestras por segundo: 20000 / 400 = 50 Hz de salida
+```
+
+`pwmTableSetRate(muestrasPorSegundo)` cambia la frecuencia en marcha y `pwmTableStop()` lo para (en español: `tablaPWM`, `tablaPWMPin`, `iniciarTablasPWM`, `velocidadTablasPWM`, `pararTablasPWM`). Ejemplos en la app: *SPWM_50Hz_IDF* y *SPWM_Tablas*. También se admiten `sinf`, `cosf`, `sqrtf`, `powf`, `fabsf`…
+
 ### Estructuras (`struct`)
 
 `struct Punto { int x; int y = 0; float peso; };`, `typedef struct { ... } Nombre;`, arrays dentro de estructuras, estructuras dentro de estructuras, arrays de estructuras, inicialización con `{1, 2}` o con `{ .x = 1, .y = 2 }`, `p.x = 5`, copiar con `=`, pasarlas a funciones (por valor, por referencia `Punto &p` o como puntero `&p`), devolverlas, `sizeof` y `typedef enum`.

@@ -314,14 +314,48 @@ struct UserTimer {
   hw_timer_t* t;
   volatile int8_t slot;
   volatile bool armed;
+  volatile bool duty;   // este temporizador aplica las tablas de duty (interrupcion acelerada)
+  bool warned;
   bool alarmOn;
   bool reload;
   uint64_t alarm;
 };
 static UserTimer utm[MAX_UTIMERS];
 
+// Tablas de duty (SPWM): en cada tick se pone en cada canal LEDC la muestra siguiente
+// de su tabla. ledc_set_duty + ledc_update_duty se pueden usar en una interrupcion si el
+// canal no tiene fade (por eso se desinstala el fade al empezar).
+struct DutyTrack { uint8_t mode, ch; uint32_t* tab; int len; volatile int pos; };
+static const int DT_MAX = 8;
+static DutyTrack dtk[DT_MAX];
+static volatile int ndtk = 0;
+static volatile bool dtOn = false;
+static hw_timer_t* dtTimer = nullptr;
+static uint32_t dtRes = 0;
+
+static void dutyStep() {
+  int n = ndtk;
+  for (int k = 0; k < n; k++) {
+    DutyTrack& t = dtk[k];
+    int p = t.pos;
+    uint32_t v = t.tab[p];
+    if (++p >= t.len) p = 0;
+    t.pos = p;
+    ledc_set_duty((ledc_mode_t)t.mode, (ledc_channel_t)t.ch, v);
+    ledc_update_duty((ledc_mode_t)t.mode, (ledc_channel_t)t.ch);
+  }
+}
+
+static void ARDUINO_ISR_ATTR dtIsr() {
+  if (dtOn) dutyStep();
+}
+
 static void ARDUINO_ISR_ATTR userTimerIsr(void* arg) {
   UserTimer* u = (UserTimer*)arg;
+  if (u->duty) {
+    if (u->armed && dtOn) dutyStep();
+    return;
+  }
   int s = u->slot;
   if (u->armed && s >= 0) postEvent(s);
 }
@@ -922,6 +956,61 @@ class EspHal : public minic::Hal {
     return 0;
   }
 
+  // ---- tablas de duty ----
+  void dutyUnbindTimers() {
+    for (int k = 0; k < MAX_UTIMERS; k++) utm[k].duty = false;
+  }
+  void stopDuty() {
+    dtOn = false;
+    dutyUnbindTimers();
+    if (dtTimer) { ::timerEnd(dtTimer); dtTimer = nullptr; }
+    int n = ndtk;
+    ndtk = 0;
+    for (int k = 0; k < n; k++) { free(dtk[k].tab); dtk[k].tab = nullptr; }
+  }
+  void dutyPrepare() {   // el fade del ESP-IDF usa un semaforo que no se puede tomar en una interrupcion
+    if (idfFade) { ledc_fade_func_uninstall(); idfFade = false; }
+  }
+  double dutyTable(int op, int a, int b, const uint32_t* data, int len) override {
+    if (op == 0) {
+      bool wasOn = dtOn;
+      dtOn = false;
+      int n = ndtk;
+      ndtk = 0;
+      for (int k = 0; k < n; k++) { free(dtk[k].tab); dtk[k].tab = nullptr; }
+      (void)wasOn;
+      return 0;
+    }
+    int mode, ch;
+    if (op == 2) {
+      ledc_channel_handle_t* bus = ledcBus(a);
+      if (!bus) return nfail("el pin %d no tiene PWM: usa antes ledcAttach(%d, frecuencia, bits)", a, a);
+      mode = bus->channel / SOC_LEDC_CHANNEL_NUM;
+      ch = bus->channel % SOC_LEDC_CHANNEL_NUM;
+    } else {
+      mode = a;
+      ch = b;
+      if (!idfMode(mode) || !idfChan(ch)) return 0;
+    }
+    if (ndtk >= DT_MAX) return nfail("como maximo %d tablas a la vez", DT_MAX);
+    for (int k = 0; k < ndtk; k++)
+      if (dtk[k].mode == mode && dtk[k].ch == ch) return nfail("ese canal ya tiene una tabla");
+    uint32_t* t = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)len);
+    if (!t) return nfail("no hay memoria para la tabla");
+    memcpy(t, data, sizeof(uint32_t) * (size_t)len);
+    bool on = dtOn;
+    dtOn = false;   // la interrupcion no debe leer la lista mientras cambia
+    DutyTrack& d = dtk[ndtk];
+    d.mode = (uint8_t)mode;
+    d.ch = (uint8_t)ch;
+    d.tab = t;
+    d.len = len;
+    d.pos = 0;
+    ndtk = ndtk + 1;
+    dtOn = on;
+    return ndtk;
+  }
+
   // ---- reproductor de secuencias ----
   void stopPattern() {
     pat.on = false;
@@ -988,6 +1077,19 @@ class EspHal : public minic::Hal {
     pat.on = true;
     ::timerAlarm(patTimer, alarm, true, 0);
     return (double)patRes / (double)alarm;
+  }
+
+  void warnFast(UserTimer& u) {   // el interprete atiende unas pocas miles de interrupciones por segundo
+    if (u.duty || u.slot < 0 || u.warned || !u.alarm || !u.reload) return;
+    double rate = (double)timerGetFrequency(u.t) / (double)u.alarm;
+    if (rate <= 2000) return;
+    u.warned = true;
+    char m[260];
+    int len = snprintf(m, sizeof m,
+                       "[X-RTbox] Aviso: esta interrupcion salta %.0f veces por segundo y el interprete solo puede atender "
+                       "unas 2000 por segundo: ira con retraso. Para PWM con tablas usa tabla[idx] en la interrupcion "
+                       "(se hace por hardware) o pwmTableAdd()/pwmTableStart().\r\n", rate);
+    write(m, (size_t)len);
   }
 
   UserTimer* timerOf(double h) {
@@ -1255,6 +1357,8 @@ class EspHal : public minic::Hal {
         utm[i].t = t;
         utm[i].slot = -1;
         utm[i].armed = true;
+        utm[i].duty = false;
+        utm[i].warned = false;
         utm[i].alarmOn = false;
         utm[i].reload = true;
         utm[i].alarm = 0;
@@ -1288,6 +1392,7 @@ class EspHal : public minic::Hal {
         u->reload = n > 2 ? a[2] != 0 : true;
         u->armed = true;
         u->alarmOn = true;
+        warnFast(*u);
         ::timerAlarm(u->t, u->alarm, u->reload, n > 3 ? (uint64_t)a[3] : 0);
         return 0;
       }
@@ -1305,6 +1410,7 @@ class EspHal : public minic::Hal {
         if (!u->alarm) return nfail("usa antes timerAlarmWrite(timer, valor, true)");
         u->armed = true;
         u->alarmOn = true;
+        warnFast(*u);
         ::timerAlarm(u->t, u->alarm, u->reload, 0);
         return 0;
       }
@@ -1511,6 +1617,46 @@ class EspHal : public minic::Hal {
       case NF_PATTERN_STOP:
         stopPattern();
         return 0;
+      case NF_DTABLE_START: case NF_DTABLE_RATE: {
+        double hz = a[0];
+        if (!(hz > 0) || hz > 100000) return nfail("las muestras por segundo deben estar entre 0 y 100000");
+        if (fn == NF_DTABLE_RATE && !dtTimer) return nfail("no hay tablas en marcha (usa antes pwmTableStart)");
+        if (fn == NF_DTABLE_START) {
+          if (!ndtk) return nfail("anade antes alguna tabla con pwmTableAdd() o pwmTableAddPin()");
+          dutyUnbindTimers();
+          dutyPrepare();
+          if (!dtTimer) {
+            static const uint32_t resList[] = {40000000, 10000000, 1000000};
+            for (int k = 0; k < 3 && !dtTimer; k++) {
+              dtTimer = ::timerBegin(resList[k]);
+              if (dtTimer) dtRes = resList[k];
+            }
+            if (!dtTimer) return nfail("no queda ningun temporizador libre");
+            ::timerAttachInterrupt(dtTimer, dtIsr);
+          }
+          for (int k = 0; k < ndtk; k++) dtk[k].pos = 0;
+        }
+        double tk = (double)dtRes / hz;
+        uint64_t alarm = (uint64_t)llround(tk < 1 ? 1 : tk);
+        dtOn = true;
+        ::timerAlarm(dtTimer, alarm, true, 0);
+        return (double)dtRes / (double)alarm;
+      }
+      case NF_DTABLE_STOP:
+        stopDuty();
+        return 0;
+      case NF_DTABLE_BIND: {   // la interrupcion del temporizador del programa aplica las tablas
+        UserTimer* u = timerOf(a[0]);
+        if (!u) return 0;
+        if (!ndtk) return nfail("no hay tablas");
+        if (dtTimer) { ::timerEnd(dtTimer); dtTimer = nullptr; }
+        dutyPrepare();
+        for (int k = 0; k < ndtk; k++) dtk[k].pos = ((int)a[1]) % dtk[k].len;
+        u->duty = true;
+        ::timerAttachInterruptArg(u->t, userTimerIsr, u);
+        dtOn = true;
+        return 0;
+      }
       case NF_PATTERN_FREQ: {
         double hz = a[0];
         if (!patTimer) return nfail("no hay ninguna secuencia en marcha (usa antes patternStart)");
@@ -1716,6 +1862,7 @@ class EspHal : public minic::Hal {
   void endTimer(UserTimer& u) {
     if (!u.t) return;
     u.armed = false;
+    u.duty = false;
     int s = u.slot;
     u.slot = -1;
     ::timerEnd(u.t);
@@ -1727,6 +1874,7 @@ class EspHal : public minic::Hal {
   void resetHardware() {
     // primero se paran todas las fuentes de interrupciones
     stopPattern();
+    stopDuty();
     for (int c = 0; c < DDS_MAX; c++) dds[c].kind = DDS_OFF;
     if (ddsTimer) { ::timerEnd(ddsTimer); ddsTimer = nullptr; }
     for (int c = 0; c < DDS_MAX; c++) dds[c].pin = -1;
