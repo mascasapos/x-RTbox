@@ -181,6 +181,9 @@ struct RxState {
 };
 static RxState bleRx, usbRx;
 
+// Peticion de captura del osciloscopio (aqui arriba por los prototipos que genera Arduino)
+struct ScopeReq { uint32_t divUs; int n; int trig; int dest; };
+
 // La app esta conectada por USB si ha mandado alguna trama hace poco
 static std::atomic<uint32_t> lastUsbFrame(0);
 static std::atomic<bool> usbSeen(false);
@@ -1943,7 +1946,6 @@ static minic::Interpreter interp(hal);
 // ---------------------------------------------------------------------
 static const int SCOPE_MAXPINS = 8;
 static const int SCOPE_MAXPTS = 500;
-struct ScopeReq { uint32_t divUs; int n; int trig; int dest; };
 static portMUX_TYPE scopeMux = portMUX_INITIALIZER_UNLOCKED;
 static ScopeReq scopeReq = {1000, 250, -1, 0};
 static TaskHandle_t scopeTaskH = nullptr;
