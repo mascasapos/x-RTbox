@@ -45,6 +45,7 @@
 #include "driver/ledc.h"
 #include "soc/soc.h"
 #include "soc/gpio_reg.h"
+#include "hal/gpio_hal.h"
 #include <Wire.h>
 #include <SPI.h>
 #include "MiniC.h"
@@ -461,6 +462,7 @@ static TwoWire* wireBus(int b) {
 class EspHal : public minic::Hal {
  public:
   uint64_t outPins = 0, pwmPins = 0, tonePins = 0, rgbPins = 0;
+  volatile uint8_t dacLast[2] = {0, 0};   // ultimo valor de dacWrite (para el osciloscopio)
   bool rgbUsed = false;
   uint32_t lastYield = 0;
   char perr[120];
@@ -568,6 +570,7 @@ class EspHal : public minic::Hal {
 #if XRT_HAS_DAC
     stopDds(pin);
     markOut(pin);
+    if (dacChannelOf(pin) >= 0) dacLast[dacChannelOf(pin)] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
     ::dacWrite(pin, (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)));
 #else
     (void)pin; (void)v;
@@ -1931,6 +1934,177 @@ static EspHal hal;
 static minic::Interpreter interp(hal);
 
 // ---------------------------------------------------------------------
+//  Osciloscopio: el ESP32 mide sus propios pines de salida
+//  Peticion (movil -> ESP32):  O<us por division>|<puntos>|<pin de disparo o -1>
+//  Respuesta: O<n>|<ventana us>|<puntos>|<19d,21d,25a>|<pin disparo>|<disparado 0/1>
+//             y tramas Q<base64 de: n, pin, desplazamiento (2 bytes), muestras 0..255>
+//  Cada punto es la media de todas las lecturas hechas en su intervalo: un PWM
+//  rapido se ve como su valor medio al alejar la escala y como onda cuadrada al acercarla.
+// ---------------------------------------------------------------------
+static const int SCOPE_MAXPINS = 8;
+static const int SCOPE_MAXPTS = 500;
+struct ScopeReq { uint32_t divUs; int n; int trig; int dest; };
+static portMUX_TYPE scopeMux = portMUX_INITIALIZER_UNLOCKED;
+static ScopeReq scopeReq = {1000, 250, -1, 0};
+static TaskHandle_t scopeTaskH = nullptr;
+static std::atomic<bool> scopeAbort(false);
+static std::atomic<bool> scopeBusy(false);
+static std::atomic<bool> scopeReady(false);
+static std::atomic<int> scopeDest(0);   // 1 = USB, 2 = Bluetooth
+static uint8_t scopeData[SCOPE_MAXPINS * SCOPE_MAXPTS];
+static char scopeHdr[180];
+static int scopeNp = 0, scopeN = 0;
+static uint8_t scopeSeq = 0;
+
+static void scopeRequest(const char* p, size_t len, int dest) {
+  std::string q(p, len);
+  unsigned long div = 1000;
+  int n = 250, trig = -1;
+  sscanf(q.c_str(), "%lu|%d|%d", &div, &n, &trig);
+  if (div < 10) div = 10;
+  if (div > 2000000) div = 2000000;
+  if (n < 50) n = 50;
+  if (n > SCOPE_MAXPTS) n = SCOPE_MAXPTS;
+  portENTER_CRITICAL(&scopeMux);
+  scopeReq.divUs = (uint32_t)div;
+  scopeReq.n = n;
+  scopeReq.trig = trig;
+  scopeReq.dest = dest;
+  portEXIT_CRITICAL(&scopeMux);
+  if (scopeBusy.load()) scopeAbort.store(true);
+  if (scopeTaskH) xTaskNotifyGive(scopeTaskH);
+}
+
+static inline uint8_t scopeAnalog(int src) {   // src: 0..DDS_MAX-1 = generador, 100/101 = dacWrite
+  if (src >= 100) return hal.dacLast[src - 100];
+  const DdsChan& d = dds[src];
+  return d.kind != DDS_OFF ? d.table[d.phase >> 24] : 0;
+}
+
+static inline uint32_t scopeRead(int pin, int src, uint32_t in0, uint32_t in1) {
+  if (src >= 0) return scopeAnalog(src);
+  return ((pin < 32 ? (in0 >> pin) : (in1 >> (pin - 32))) & 1u) ? 255u : 0u;
+}
+
+static void scopeCapture(const ScopeReq& r) {
+  int pins[SCOPE_MAXPINS], src[SCOPE_MAXPINS];
+  int np = 0;
+  for (int p = 0; p < SOC_GPIO_PIN_COUNT && p < 64 && np < SCOPE_MAXPINS; p++) {
+    if (!(hal.outPins & (1ULL << p))) continue;
+    int s = -1;
+    for (int c = 0; c < DDS_MAX; c++)
+      if (dds[c].kind != DDS_OFF && dds[c].pin == p) s = c;
+#if XRT_HAS_DAC
+    int dch = dacChannelOf(p);
+    if (s < 0 && dch >= 0 && perimanGetPinBus((uint8_t)p, ESP32_BUS_TYPE_DAC_ONESHOT) != nullptr) s = 100 + dch;
+#endif
+    if (s < 0) {   // lectura digital: se activa la entrada del pin (no cambia la salida)
+      gpio_hal_context_t gh;
+      gh.dev = GPIO_LL_GET_HW(GPIO_PORT_0);
+      gpio_hal_input_enable(&gh, (gpio_num_t)p);
+    }
+    pins[np] = p;
+    src[np] = s;
+    np++;
+  }
+  int n = r.n;
+  double winUs = (double)r.divUs * 10.0;
+  double dtUs = winUs / n;
+  bool trigOk = false;
+  int ti = -1;
+  for (int k = 0; k < np; k++)
+    if (pins[k] == r.trig) ti = k;
+  if (ti < 0 && np > 0) ti = 0;
+  uint32_t mhz = getCpuFrequencyMhz();
+  // disparo: flanco de subida en el pin elegido (o el primero)
+  if (ti >= 0) {
+    double toUs = winUs * 2;
+    if (toUs < 30000) toUs = 30000;
+    if (toUs > 250000) toUs = 250000;
+    uint32_t c0 = ESP.getCycleCount();
+    uint32_t lim = (uint32_t)(toUs * mhz);
+    int stage = 0;
+    while ((uint32_t)(ESP.getCycleCount() - c0) < lim && !scopeAbort.load()) {
+      uint32_t in0 = REG_READ(GPIO_IN_REG), in1 = 0;
+#ifdef GPIO_IN1_REG
+      in1 = REG_READ(GPIO_IN1_REG);
+#endif
+      bool hi = scopeRead(pins[ti], src[ti], in0, in1) >= 128;
+      if (stage == 0 && !hi) stage = 1;
+      else if (stage == 1 && hi) { trigOk = true; break; }
+    }
+  }
+  memset(scopeData, 0, sizeof scopeData);
+  if (dtUs < 3000 && winUs <= 1500000) {
+    // rapido: bucle con el contador de ciclos de la CPU
+    uint32_t t0 = ESP.getCycleCount();
+    double cpd = dtUs * mhz;
+    for (int i = 0; i < n && !scopeAbort.load(); i++) {
+      uint32_t end = t0 + (uint32_t)((double)(i + 1) * cpd);
+      uint32_t acc[SCOPE_MAXPINS] = {0};
+      uint32_t cnt = 0;
+      do {
+        uint32_t in0 = REG_READ(GPIO_IN_REG), in1 = 0;
+#ifdef GPIO_IN1_REG
+        in1 = REG_READ(GPIO_IN1_REG);
+#endif
+        for (int k = 0; k < np; k++) acc[k] += scopeRead(pins[k], src[k], in0, in1);
+        cnt++;
+      } while ((int32_t)(ESP.getCycleCount() - end) < 0);
+      for (int k = 0; k < np; k++) scopeData[k * n + i] = (uint8_t)(acc[k] / cnt);
+    }
+  } else {
+    // lento: lecturas espaciadas, dejando correr al resto del sistema
+    int64_t start = esp_timer_get_time();
+    for (int i = 0; i < n && !scopeAbort.load(); i++) {
+      int64_t end = start + (int64_t)((double)(i + 1) * dtUs);
+      uint32_t acc[SCOPE_MAXPINS] = {0};
+      uint32_t cnt = 0;
+      for (;;) {
+        uint32_t in0 = REG_READ(GPIO_IN_REG), in1 = 0;
+#ifdef GPIO_IN1_REG
+        in1 = REG_READ(GPIO_IN1_REG);
+#endif
+        for (int k = 0; k < np; k++) acc[k] += scopeRead(pins[k], src[k], in0, in1);
+        cnt++;
+        int64_t left = end - esp_timer_get_time();
+        if (left <= 0) break;
+        if (left > 3000) vTaskDelay(1);
+        else ::delayMicroseconds(left > 50 ? 50 : (uint32_t)left);
+      }
+      for (int k = 0; k < np; k++) scopeData[k * n + i] = (uint8_t)(acc[k] / cnt);
+    }
+  }
+  if (scopeAbort.load()) return;
+  // cabecera
+  scopeSeq++;
+  int len = snprintf(scopeHdr, sizeof scopeHdr, "%u|%lu|%d|", (unsigned)scopeSeq, (unsigned long)(winUs + 0.5), n);
+  for (int k = 0; k < np && len < (int)sizeof(scopeHdr) - 12; k++)
+    len += snprintf(scopeHdr + len, sizeof(scopeHdr) - len, "%s%d%c", k ? "," : "", pins[k], src[k] >= 0 ? 'a' : 'd');
+  snprintf(scopeHdr + len, sizeof(scopeHdr) - len, "|%d|%d", ti >= 0 ? pins[ti] : -1, trigOk ? 1 : 0);
+  scopeNp = np;
+  scopeN = n;
+  scopeDest.store(r.dest);
+  scopeReady.store(true);
+}
+
+static void scopeTask(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (scopeReady.load()) vTaskDelay(pdMS_TO_TICKS(5));   // espera a que se envie la anterior
+    ScopeReq r;
+    portENTER_CRITICAL(&scopeMux);
+    r = scopeReq;
+    portEXIT_CRITICAL(&scopeMux);
+    scopeAbort.store(false);
+    scopeBusy.store(true);
+    scopeCapture(r);
+    scopeBusy.store(false);
+    if (scopeAbort.exchange(false)) xTaskNotifyGive(scopeTaskH);   // habia una peticion nueva
+  }
+}
+
+// ---------------------------------------------------------------------
 //  Protocolo (igual por Bluetooth y por USB)
 // ---------------------------------------------------------------------
 static void handleIncoming(const uint8_t* d, size_t n, RxState& rx) {
@@ -2006,6 +2180,7 @@ static void handleIncoming(const uint8_t* d, size_t n, RxState& rx) {
       return;
     }
     case 'W': progInput.write(p, len); return;
+    case 'O': scopeRequest(p, len, &rx == &usbRx ? 1 : 2); return;   // osciloscopio
     default: return;
   }
 }
@@ -2128,6 +2303,67 @@ class RxCB : public BLECharacteristicCallbacks {
   }
 };
 
+// Envia los datos del osciloscopio (cabecera O y tramas Q en base64)
+static size_t b64encode(const uint8_t* in, size_t n, char* out) {
+  static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t w = 0;
+  for (size_t i = 0; i < n; i += 3) {
+    uint32_t v = (uint32_t)in[i] << 16;
+    if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+    if (i + 2 < n) v |= in[i + 2];
+    out[w++] = t[(v >> 18) & 63];
+    out[w++] = t[(v >> 12) & 63];
+    out[w++] = i + 1 < n ? t[(v >> 6) & 63] : '=';
+    out[w++] = i + 2 < n ? t[v & 63] : '=';
+  }
+  return w;
+}
+
+static void scopeSendFrame(char type, const char* txt, size_t n, int dest) {
+  static char buf[560];
+  if (n > sizeof(buf) - 3) n = sizeof(buf) - 3;
+  if (dest == 1) {
+    buf[0] = 0x1E;
+    buf[1] = type;
+    memcpy(buf + 2, txt, n);
+    buf[n + 2] = '\n';
+    Serial.write((const uint8_t*)buf, n + 3);
+  } else if (bleConnected.load()) {
+    buf[0] = type;
+    memcpy(buf + 1, txt, n);
+    pTx->setValue((uint8_t*)buf, n + 1);
+    pTx->notify();
+    vTaskDelay(pdMS_TO_TICKS(4));
+  }
+}
+
+static void scopeSend() {
+  int dest = scopeDest.load();
+  if (dest == 1 && !usbAppActive()) return;
+  scopeSendFrame('O', scopeHdr, strlen(scopeHdr), dest);
+  size_t chunk = 150;
+  if (dest == 2) {
+    size_t maxText = (size_t)bleMtu.load() - 4;
+    chunk = (maxText / 4) * 3;
+    chunk = chunk > 8 ? chunk - 4 : 4;
+    if (chunk > 300) chunk = 300;
+  }
+  static uint8_t raw[310];
+  static char txt[420];
+  for (int k = 0; k < scopeNp; k++) {
+    for (int off = 0; off < scopeN; off += (int)chunk) {
+      int m = scopeN - off < (int)chunk ? scopeN - off : (int)chunk;
+      raw[0] = scopeSeq;
+      raw[1] = (uint8_t)k;
+      raw[2] = (uint8_t)(off >> 8);
+      raw[3] = (uint8_t)(off & 0xFF);
+      memcpy(raw + 4, scopeData + k * scopeN + off, (size_t)m);
+      size_t t = b64encode(raw, (size_t)m + 4, txt);
+      scopeSendFrame('Q', txt, t, dest);
+    }
+  }
+}
+
 // Tarea de comunicacion: lee el USB y envia al movil (Bluetooth y/o USB)
 // los mensajes y la salida del programa
 static void commTask(void*) {
@@ -2139,6 +2375,10 @@ static void commTask(void*) {
     bool conn = bleConnected.load();
     bool usb = usbAppActive();
     if (cmdInfo.exchange(false)) sendState();
+    if (scopeReady.load()) {
+      scopeSend();
+      scopeReady.store(false);
+    }
     CtlMsg m;
     while (xQueueReceive(ctlQueue, &m, 0) == pdTRUE) {
       size_t n = strlen(m.text);
@@ -2360,6 +2600,7 @@ void setup() {
   ctlQueue = xQueueCreate(12, sizeof(CtlMsg));
   setupBle();
   xTaskCreatePinnedToCore(commTask, "xrtbox_comm", 6144, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(scopeTask, "xrtbox_scope", 4096, nullptr, 1, &scopeTaskH, 0);
   Serial.printf("[X-RTbox] Memoria libre: %u bytes\n", (unsigned)ESP.getFreeHeap());
   if (xTaskCreatePinnedToCore(vmTask, "xrtbox_vm", VM_STACK, safeBoot ? (void*)1 : nullptr, 1, nullptr,
                               ARDUINO_RUNNING_CORE) != pdPASS) {

@@ -56,6 +56,12 @@ public class MainActivity extends Activity implements EspLink.Listener {
     private static final int SCREEN_CREATE = 1;
     private static final int SCREEN_STORE = 2;
     private static final int SCREEN_LINK = 3;
+    private static final int SCREEN_SCOPE = 4;
+
+    // osciloscopio: escalas (1-2-5)
+    private static final int[] TIME_DIVS_US = {20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000,
+            100000, 200000, 500000, 1000000};
+    private static final double[] VOLT_DIVS = {0.1, 0.2, 0.5, 1.0, 2.0, 5.0};
 
     private static final int REQ_PERMS = 10;
     private static final int REQ_ENABLE_BT = 11;
@@ -84,6 +90,14 @@ public class MainActivity extends Activity implements EspLink.Listener {
 
     // cabecera
     private RadiationView logo;
+    private View btnScope;
+    private int scopeTimeIdx = 5;      // 1 ms/div
+    private int scopeVoltIdx = 3;      // 1 V/div
+    private int scopeTrigPin = -1;
+    private boolean scopePaused = false;
+    private LinearLayout scopeList;
+    private TextView scopeStatus, scopeTime, scopeVolt, scopeTrig;
+    private Button btnScopeRun;
     private TextView busyLabel;
     private TextView appTitle;
     private TextView statusText;
@@ -131,6 +145,13 @@ public class MainActivity extends Activity implements EspLink.Listener {
         appTitle = findViewById(R.id.appTitle);
         statusText = findViewById(R.id.statusText);
         content = findViewById(R.id.content);
+        btnScope = findViewById(R.id.btnScope);
+        btnScope.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showScreen(SCREEN_SCOPE);
+            }
+        });
         ble = EspLink.get(this);
         store = new ProgramStore(this);
         ble.addListener(this);
@@ -180,12 +201,21 @@ public class MainActivity extends Activity implements EspLink.Listener {
     protected void onResume() {
         super.onResume();
         if (screen == SCREEN_STORE) refreshPrograms();
+        if (screen == SCREEN_SCOPE && !scopePaused) startScope();
+    }
+
+    @Override
+    protected void onPause() {
+        if (screen == SCREEN_SCOPE) ble.stopScope();
+        super.onPause();
     }
 
     @SuppressWarnings("deprecation")
     @Override
     public void onBackPressed() {
-        if (screen != SCREEN_HOME) {
+        if (screen == SCREEN_SCOPE) {
+            showScreen(SCREEN_STORE);
+        } else if (screen != SCREEN_HOME) {
             if (screen == SCREEN_LINK) ble.stopScan();
             showScreen(SCREEN_HOME);
         } else {
@@ -201,12 +231,14 @@ public class MainActivity extends Activity implements EspLink.Listener {
     }
 
     private void showScreen(int s) {
+        if (screen == SCREEN_SCOPE && s != SCREEN_SCOPE) ble.stopScope();
         screen = s;
+        btnScope.setVisibility(s == SCREEN_STORE ? View.VISIBLE : View.GONE);
         content.removeAllViews();
         LayoutInflater inf = getLayoutInflater();
         boolean home = s == SCREEN_HOME;
         int size = dp(home ? 190 : 86);
-        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) logo.getLayoutParams();
+        ViewGroup.LayoutParams lp = logo.getLayoutParams();
         lp.width = size;
         lp.height = size;
         logo.setLayoutParams(lp);
@@ -226,6 +258,10 @@ public class MainActivity extends Activity implements EspLink.Listener {
             case SCREEN_LINK:
                 inf.inflate(R.layout.screen_link, content, true);
                 setupLink();
+                break;
+            case SCREEN_SCOPE:
+                inf.inflate(R.layout.screen_scope, content, true);
+                setupScope();
                 break;
             default:
                 inf.inflate(R.layout.screen_home, content, true);
@@ -802,6 +838,125 @@ public class MainActivity extends Activity implements EspLink.Listener {
         v.setAlpha(on ? 1f : 0.4f);
     }
 
+    // ---------------- Osciloscopio ----------------
+    private void setupScope() {
+        scopeList = content.findViewById(R.id.scopeList);
+        scopeStatus = content.findViewById(R.id.scopeStatus);
+        scopeTime = content.findViewById(R.id.scopeTime);
+        scopeVolt = content.findViewById(R.id.scopeVolt);
+        scopeTrig = content.findViewById(R.id.scopeTrig);
+        btnScopeRun = content.findViewById(R.id.btnScopeRun);
+        DPadView pad = content.findViewById(R.id.dpad);
+        pad.setListener(new DPadView.Listener() {
+            @Override
+            public void onPad(int dir) {
+                switch (dir) {
+                    case DPadView.LEFT:
+                        if (scopeTimeIdx > 0) scopeTimeIdx--;
+                        break;
+                    case DPadView.RIGHT:
+                        if (scopeTimeIdx < TIME_DIVS_US.length - 1) scopeTimeIdx++;
+                        break;
+                    case DPadView.UP:
+                        if (scopeVoltIdx < VOLT_DIVS.length - 1) scopeVoltIdx++;
+                        break;
+                    default:
+                        if (scopeVoltIdx > 0) scopeVoltIdx--;
+                        break;
+                }
+                if (dir == DPadView.LEFT || dir == DPadView.RIGHT) ble.setScopeTimebase(TIME_DIVS_US[scopeTimeIdx]);
+                for (int k = 0; k < scopeList.getChildCount(); k++) {
+                    View v = scopeList.getChildAt(k);
+                    if (v instanceof ScopeView) ((ScopeView) v).setVoltsPerDiv(VOLT_DIVS[scopeVoltIdx]);
+                }
+                updateScopeLabels();
+            }
+        });
+        btnScopeRun.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                scopePaused = !scopePaused;
+                if (scopePaused) ble.stopScope();
+                else startScope();
+                updateScopeLabels();
+            }
+        });
+        updateScopeLabels();
+        updateScopeStatus(null);
+        if (!scopePaused) startScope();
+    }
+
+    private void startScope() {
+        ble.startScope(TIME_DIVS_US[scopeTimeIdx], scopeTrigPin);
+    }
+
+    private static String timeDivText(int us) {
+        if (us >= 1000000) return (us / 1000000) + " s/div";
+        if (us >= 1000) return (us / 1000) + " ms/div";
+        return us + " µs/div";
+    }
+
+    private void updateScopeLabels() {
+        if (screen != SCREEN_SCOPE || scopeTime == null) return;
+        scopeTime.setText("⏱ " + timeDivText(TIME_DIVS_US[scopeTimeIdx]));
+        double v = VOLT_DIVS[scopeVoltIdx];
+        scopeVolt.setText("⚡ " + (v < 1 ? String.format(Locale.US, "%d mV/div", Math.round(v * 1000)) : String.format(Locale.US, "%.0f V/div", v)));
+        scopeTrig.setText("Disparo: " + (scopeTrigPin >= 0 ? "GPIO " + scopeTrigPin : "primer pin") + " ↑");
+        btnScopeRun.setText(scopePaused ? R.string.scope_resume : R.string.scope_pause);
+    }
+
+    private void updateScopeStatus(EspLink.ScopeFrame f) {
+        if (screen != SCREEN_SCOPE || scopeStatus == null) return;
+        if (ble.getLinkState() != EspLink.LINK_READY) {
+            scopeStatus.setText("Enlaza el ESP32 (ENLAZAR ESP32) para ver las señales de sus pines.");
+        } else if (scopePaused) {
+            scopeStatus.setText("En pausa: pulsa SEGUIR para volver a medir.");
+        } else if (f == null) {
+            scopeStatus.setText("Midiendo los pines de salida del ESP32...");
+        } else if (f.pins.length == 0) {
+            scopeStatus.setText("El ESP32 no tiene ningún pin de salida activo: carga un programa que use pines como salida.");
+        } else {
+            StringBuilder b = new StringBuilder("Pines activos: ");
+            for (int k = 0; k < f.pins.length; k++) b.append(k > 0 ? ", " : "").append(f.pins[k]);
+            b.append(f.triggered ? "  ·  disparado" : "  ·  sin disparo (libre)");
+            if (ble.getRemoteFirmwareVersion() != null && ble.isFirmwareOutdated()) b.append("\n⚠ Actualiza el firmware del ESP32");
+            scopeStatus.setText(b);
+        }
+    }
+
+    @Override
+    public void onScopeData(EspLink.ScopeFrame f) {
+        if (screen != SCREEN_SCOPE || scopeList == null) return;
+        // una pantalla por pin activo (se rehace si cambian los pines)
+        boolean same = scopeList.getChildCount() == f.pins.length;
+        for (int k = 0; same && k < f.pins.length; k++) same = ((ScopeView) scopeList.getChildAt(k)).getPin() == f.pins[k];
+        if (!same) {
+            scopeList.removeAllViews();
+            for (int k = 0; k < f.pins.length; k++) {
+                final ScopeView sv = new ScopeView(this);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                if (k > 0) lp.topMargin = dp(10);
+                sv.setLayoutParams(lp);
+                sv.setVoltsPerDiv(VOLT_DIVS[scopeVoltIdx]);
+                sv.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        scopeTrigPin = sv.getPin();
+                        ble.setScopeTrigger(scopeTrigPin);
+                        updateScopeLabels();
+                        toast("Disparo con el GPIO " + scopeTrigPin);
+                    }
+                });
+                scopeList.addView(sv);
+            }
+        }
+        for (int k = 0; k < f.pins.length; k++) {
+            ((ScopeView) scopeList.getChildAt(k)).setTrace(f.pins[k], f.data[k], f.n, f.analog[k], f.windowUs,
+                    f.pins[k] == f.trigPin, f.triggered);
+        }
+        updateScopeStatus(f);
+    }
+
     // ---------------- USB ----------------
     private interface UsbAction {
         void run(UsbDevice d);
@@ -932,6 +1087,7 @@ public class MainActivity extends Activity implements EspLink.Listener {
     public void onLinkChanged() {
         updateHeader();
         refreshLink();
+        if (screen == SCREEN_SCOPE && ble.getLinkState() != EspLink.LINK_READY) updateScopeStatus(null);
         if (screen == SCREEN_STORE && programAdapter != null) programAdapter.notifyDataSetChanged();
     }
 

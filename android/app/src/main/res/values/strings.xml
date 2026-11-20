@@ -33,4 +33,9 @@
     <string name="disconnect">DESCONECTAR</string>
     <string name="devices_found">DISPOSITIVOS ENCONTRADOS</string>
     <string name="back">‹</string>
+    <string name="title_scope">OSCILOSCOPIO</string>
+    <string name="scope_pause">PAUSA</string>
+    <string name="scope_resume">SEGUIR</string>
+    <string name="scope_open">Osciloscopio</string>
+    <string name="scope_hint">◀ ▶ tiempo por división · ▲ ▼ tensión por división · toca una gráfica para disparar con ese pin</string>
 </resources>

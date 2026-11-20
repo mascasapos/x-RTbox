@@ -76,6 +76,8 @@ Chips compatibles: ESP32, ESP32‑S3, ESP32‑C3 y ESP32‑C6. El **ESP32‑S2 n
    - **■ DETENER** para el programa y deja los pines en reposo. **▶ REINICIAR** lo vuelve a ejecutar desde `setup()`.
    - Si hay un error, la app te dice la línea y te lleva al editor con *IR A LA LÍNEA*.
 
+**Osciloscopio:** en el ALMACÉN, junto al logo, está el botón del osciloscopio. Muestra una pantalla por cada pin de salida que esté usando el programa (fondo negro, señal en verde y rejilla de 10 × 8 divisiones), con la frecuencia, el ciclo de trabajo y la tensión medidos. Con la **cruceta**, ◀ ▶ cambian el tiempo por división (de 20 µs a 1 s) y ▲ ▼ la tensión por división (de 0,1 a 5 V). Toca una gráfica para disparar con ese pin (flanco de subida). El propio ESP32 mide sus pines: las señales digitales (PWM, `digitalWrite`, secuencias…) se leen del registro de entrada y las del DAC/generadores salen con su valor real. Cada punto es la media de todas las lecturas de su intervalo, así que un PWM muy rápido se ve como su valor medio (una SPWM se ve como la senoidal) y, al acercar la escala, como onda cuadrada. Por cable va más fluido que por Bluetooth.
+
 El **logo de radiactividad gira** mientras la app trabaja (buscando, conectando, cargando, instalando firmware…) y se queda quieto al terminar.
 
 El ESP32 **recuerda el último programa** y lo ejecuta solo al encenderse. Si un programa da problemas, enciende el ESP32 con **BOOT** pulsado y arrancará sin ejecutarlo.

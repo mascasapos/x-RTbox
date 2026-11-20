@@ -100,6 +100,21 @@ public class EspLink {
 
         /** El ESP32 tiene un firmware distinto del que trae la app ("" = antiguo, sin version). */
         void onFirmwareOutdated(String remoteVersion);
+
+        /** Nueva captura del osciloscopio. */
+        void onScopeData(ScopeFrame frame);
+    }
+
+    /** Captura del osciloscopio: muestras 0..255 (0..3,3 V) de cada pin activo. */
+    public static final class ScopeFrame {
+        public int seq;
+        public int windowUs;
+        public int n;
+        public int[] pins = new int[0];
+        public boolean[] analog = new boolean[0];
+        public byte[][] data = new byte[0][];
+        public int trigPin = -1;
+        public boolean triggered;
     }
 
     public interface UsbPermissionCallback {
@@ -155,6 +170,19 @@ public class EspLink {
     private String remoteState = "NONE";
     private String remoteProgram = "";
     private String remoteFw = null;       // version del firmware del ESP32 (null = aun no se sabe)
+    // osciloscopio
+    private static final int SCOPE_POINTS = 250;
+    private boolean scopeOn = false;
+    private int scopeDivUs = 1000;
+    private int scopeTrig = -1;
+    private ScopeFrame scopeBuild = null;
+    private int scopeGot = 0;
+    private final Runnable scopeRequestRunnable = new Runnable() {
+        @Override
+        public void run() {
+            requestScope();
+        }
+    };
     private boolean fwWarned = false;
     private String bundledFw = null;
     private int remoteHeap = 0;
@@ -1239,6 +1267,105 @@ public class EspLink {
         return transport == TRANSPORT_USB ? usbDevice : null;
     }
 
+    // ------------------------------------------------------------------
+    //  Osciloscopio: el ESP32 mide sus pines de salida y manda las muestras
+    // ------------------------------------------------------------------
+    /** Empieza a pedir capturas (us por division, pin de disparo o -1). */
+    public void startScope(int divUs, int trigPin) {
+        scopeOn = true;
+        scopeDivUs = divUs;
+        scopeTrig = trigPin;
+        requestScope();
+    }
+
+    public void stopScope() {
+        scopeOn = false;
+        scopeBuild = null;
+        main.removeCallbacks(scopeRequestRunnable);
+    }
+
+    public boolean isScopeOn() {
+        return scopeOn;
+    }
+
+    public void setScopeTimebase(int divUs) {
+        scopeDivUs = divUs;
+        if (scopeOn) requestScope();
+    }
+
+    public void setScopeTrigger(int pin) {
+        scopeTrig = pin;
+        if (scopeOn) requestScope();
+    }
+
+    private void requestScope() {
+        main.removeCallbacks(scopeRequestRunnable);
+        if (!scopeOn) return;
+        if (link != LINK_READY || flashing || sending) {
+            main.postDelayed(scopeRequestRunnable, 700);
+            return;
+        }
+        enqueue(("O" + scopeDivUs + "|" + SCOPE_POINTS + "|" + scopeTrig).getBytes(StandardCharsets.UTF_8));
+        // si no llega la captura entera, se vuelve a pedir
+        main.postDelayed(scopeRequestRunnable, scopeDivUs * 10L / 1000L + 3000L);
+    }
+
+    private void scopeHeader(String h) {
+        if (!scopeOn) return;
+        String[] p = h.split("\\|", -1);
+        if (p.length < 6) return;
+        try {
+            ScopeFrame f = new ScopeFrame();
+            f.seq = Integer.parseInt(p[0].trim()) & 0xFF;
+            f.windowUs = Integer.parseInt(p[1].trim());
+            f.n = Integer.parseInt(p[2].trim());
+            String[] ps = p[3].isEmpty() ? new String[0] : p[3].split(",");
+            f.pins = new int[ps.length];
+            f.analog = new boolean[ps.length];
+            f.data = new byte[ps.length][f.n];
+            for (int k = 0; k < ps.length; k++) {
+                String q = ps[k].trim();
+                f.analog[k] = q.endsWith("a");
+                f.pins[k] = Integer.parseInt(q.substring(0, q.length() - 1));
+            }
+            f.trigPin = Integer.parseInt(p[4].trim());
+            f.triggered = "1".equals(p[5].trim());
+            scopeBuild = f;
+            scopeGot = 0;
+            if (ps.length == 0) scopeDeliver();
+        } catch (RuntimeException e) {
+            scopeBuild = null;
+        }
+    }
+
+    private void scopeChunk(String b64) {
+        ScopeFrame f = scopeBuild;
+        if (f == null) return;
+        byte[] b;
+        try {
+            b = java.util.Base64.getDecoder().decode(b64.trim());
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        if (b.length < 5 || (b[0] & 0xFF) != f.seq) return;
+        int k = b[1] & 0xFF;
+        int off = ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+        int m = b.length - 4;
+        if (k >= f.data.length || off + m > f.n) return;
+        System.arraycopy(b, 4, f.data[k], off, m);
+        scopeGot += m;
+        if (scopeGot >= f.n * f.data.length) scopeDeliver();
+    }
+
+    private void scopeDeliver() {
+        ScopeFrame f = scopeBuild;
+        scopeBuild = null;
+        if (f == null || !scopeOn) return;
+        main.removeCallbacks(scopeRequestRunnable);
+        for (Listener l : new ArrayList<>(listeners)) l.onScopeData(f);
+        main.postDelayed(scopeRequestRunnable, transport == TRANSPORT_USB ? 40 : 150);
+    }
+
     /** Firmwares incluidos en la app (assets/firmware/*.bin). */
     public List<String> bundledFirmwares() {
         List<String> out = new ArrayList<>();
@@ -1357,6 +1484,12 @@ public class EspLink {
                 else notifyResult(false, remoteProgram, msg);
                 break;
             }
+            case 'O':
+                scopeHeader(new String(payload, StandardCharsets.UTF_8));
+                break;
+            case 'Q':
+                scopeChunk(new String(payload, StandardCharsets.UTF_8));
+                break;
             case 'T': {
                 String s = new String(payload, StandardCharsets.UTF_8);
                 String[] p = s.split("\\|", -1);

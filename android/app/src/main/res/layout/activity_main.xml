@@ -14,10 +14,27 @@
         android:orientation="vertical"
         android:paddingTop="12dp">
 
-        <com.xrtbox.app.RadiationView
-            android:id="@+id/logo"
-            android:layout_width="190dp"
-            android:layout_height="190dp" />
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <com.xrtbox.app.RadiationView
+                android:id="@+id/logo"
+                android:layout_width="190dp"
+                android:layout_height="190dp"
+                android:layout_gravity="center_horizontal" />
+
+            <ImageButton
+                android:id="@+id/btnScope"
+                android:layout_width="62dp"
+                android:layout_height="50dp"
+                android:layout_gravity="end|center_vertical"
+                android:layout_marginRight="22dp"
+                android:background="@drawable/btn_outline"
+                android:contentDescription="@string/scope_open"
+                android:src="@drawable/ic_scope"
+                android:visibility="gone" />
+        </FrameLayout>
 
         <TextView
             android:id="@+id/busyLabel"
